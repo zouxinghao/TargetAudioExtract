@@ -1,0 +1,4269 @@
+config.py-----------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+运行参数配置，包括日志，数据文件，模型文件，模型参数等
+"""
+
+import logging
+import inspect
+import os
+
+################################
+# 日志配置
+_run_script = inspect.stack()[-1][1]
+# 运行脚本名
+RUN_SCRIPT = os.path.basename(_run_script)
+_run_script_no_ext = os.path.splitext(RUN_SCRIPT)[0]
+# 日志文件名
+LOG_FILENAME = '%s.log' % _run_script_no_ext
+
+# 配置日志输出文件及级别
+FORMAT = '%(asctime)s::%(levelname)s::%(message)s'
+logging.basicConfig(filename=LOG_FILENAME, level=logging.INFO, format=FORMAT,
+                    filemode='a')
+
+# 同时输出到控制台
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter(FORMAT))
+logging.getLogger('').addHandler(console)
+
+################################
+# 数据目录与文件路径
+# 数据根目录
+DATA_ROOT = './data'
+
+# 训练数据
+DATA_TRAIN_ROOT = DATA_ROOT + '/male_train'
+# csv文件，第一列为训练wav文件名
+DATA_TRAIN_LIST = DATA_TRAIN_ROOT + '/data.csv'
+# 混合后数据目录
+DATA_TRAIN_MIX_ROOT = DATA_ROOT + '/train.mix'
+
+# 测试数据，参考训练数据
+DATA_TEST_ROOT = DATA_ROOT + '/male_test'
+DATA_TEST_LIST = DATA_TEST_ROOT + '/data.csv'
+DATA_TEST_MIX_ROOT = DATA_ROOT + '/test.mix'
+
+# 用于循环得到更多的信号
+DATA_TRAIN_LOOP_SIGNAL = DATA_ROOT + '/male_train.wav'
+DATA_TEST_LOOP_SIGNAL = DATA_ROOT + '/male_test.wav'
+
+# 训练与测试信号
+DATA_TRAIN_STATIC_SIGNAL = DATA_ROOT + '/female_train.wav'
+DATA_TEST_STATIC_SIGNAL = DATA_ROOT + '/female_test.wav'
+
+################################
+# 模型存放目录与文件路径
+MODEL_ROOT = './model'
+# 神经网络模型
+MODEL_NN_PATH = MODEL_ROOT + '/neural_net.model'
+
+################################
+# 训练参数配置
+# wav采样率
+SAMPLE_RATE = 16000
+# STFT每帧点数
+STFT_POINT = 1024
+# STFT每帧重叠 1/DN_STFT_OVERLAP
+STFT_OVERLAP = 2
+# 神经网络隐藏层每层激活元数量
+LAYER_SIZE = [16]
+# 模型训练次数
+EPOCH = 100
+# 神经网络输入，每帧前/后扩展数
+EXTEND_NUM = 0
+# 神经网络学习速率
+LEARNING_RATE = 0.001
+# 是否正则化
+NORMALIZATION = True
+
+
+dnn4bss.py---------------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+基于神经网络的盲源分离模型
+
+参考：
+P.-S. Huang, M. Kim, M. Hasegawa-Johnson, P. Smaragdis, "Deep Learning for
+Monaural Speech Separation,"
+in IEEE International Conference on Acoustic,
+Speech and Signal Processing 2014.
+"""
+
+import matlab.engine
+import config
+import logging
+import util
+import os
+import numpy as np
+import nn
+import soundfile as sf
+import stft
+
+
+def train():
+    logging.info('train bss model')
+    sig1_list = util.load_data(config.DATA_TRAIN_LIST, config.DATA_TRAIN_ROOT)
+    sig2 = util.read_wav(config.DATA_TRAIN_STATIC_SIGNAL)
+
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TRAIN_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TRAIN_LIST,
+                                      config.DATA_TRAIN_STATIC_SIGNAL,
+                                      config.DATA_TRAIN_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list, sig2_list,
+                                              output=mix_filenames)
+
+    logging.info('extract stft features')
+    sig1_stft = _extract_stft(sig1_list)
+    sig2_stft = _extract_stft(sig2_list)
+    mix_stft = _extract_stft(mix_list)
+
+    logging.info('train neural network')
+    sig1_stft = util.r_abs(sig1_stft)
+    sig2_stft = util.r_abs(sig2_stft)
+    mix_stft = util.r_abs(mix_stft)
+
+    train_x, train_y = mix_stft, []
+    for s, n in zip(sig1_stft, sig2_stft):  # 将signal和noise拼接作为nn输出
+        train_y.append(np.concatenate((s, n), axis=1))
+    train_x = [_extend(sig, config.EXTEND_NUM) for sig in train_x]
+
+    # 各层神经元数量
+    layer_size = [len(train_x[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(train_y[0][0]))  # 输出层
+
+    dnn = nn.NNet(layer_size)
+    util.mkdir_p(config.MODEL_ROOT)
+    dnn.train(train_x, train_y, model_path=config.MODEL_NN_PATH,
+              training_epochs=config.EPOCH, learning_rate=config.LEARNING_RATE)
+    # dnn.test(train_x, train_y, model_path=config.MODEL_DN_NN_PATH)
+
+
+def _normalize(sig):
+    sig = np.array(sig)
+    return sig / np.sqrt(np.sum(sig ** 2))
+
+
+def _extend(sig, increment):
+    '''
+    将每帧与前后帧连结
+    :param sig: 信号
+    :param increment: 前/后连结帧数量
+    :return:
+    '''
+    recurrent_train_x = []
+    for i in range(len(sig)):  # 帧数
+        temp = []
+        for k in range(i - increment, i + increment + 1):
+            if k < 0 or k >= len(sig):
+                temp.extend(np.zeros(len(sig[i])))
+            else:
+                temp.extend(sig[k])
+        temp_2 = np.array(temp)
+        recurrent_train_x.append(temp_2)
+    return recurrent_train_x
+
+
+def _extract_stft(audios):
+    stfts = []
+    for ad in audios:
+        st = stft.spectrogram(ad, framelength=config.STFT_POINT,
+                              overlap=config.STFT_OVERLAP)
+        st = st.transpose()
+        stfts.append(st)
+    return stfts
+
+
+def test():
+    logging.info('test denoising model')
+    logging.info("read test signal according to %s, read noise from %s" %
+                 (config.DATA_TEST_LIST, config.DATA_TEST_STATIC_SIGNAL))
+    sig1_list = util.load_data(config.DATA_TEST_LIST, config.DATA_TEST_ROOT)
+    sig2 = util.read_wav(config.DATA_TEST_STATIC_SIGNAL)
+
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TEST_LIST,
+                                      config.DATA_TEST_STATIC_SIGNAL,
+                                      config.DATA_TEST_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list,
+                                              sig2_list, output=mix_filenames)
+
+    logging.info('extract stft features')
+    mix_stft = _extract_stft(mix_list)
+
+    mix_data = util.r_abs(mix_stft)
+    mix_data = [_extend(sig, config.EXTEND_NUM) for sig in mix_data]
+
+    logging.info('run neural network')
+    # 各层神经元数量
+    layer_size = [len(mix_data[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(mix_stft[0][0]) * 2)  # 输出层
+    dnn = nn.NNet(layer_size)
+    sig1_sig2 = dnn.run(mix_data, model_path=config.MODEL_NN_PATH)
+    # 神经网络输出为预测signal1与signal2的拼接，此处分离
+    sig1_stft, sig2_stft = _separate(sig1_sig2)
+
+    logging.info('Time-Frequency Masking')
+    mask = []
+    for s, n in zip(sig1_stft, sig2_stft):
+        mask.append(_build_ibm(s, n))
+    sig1_stft = [np.multiply(mix, m) for mix, m in zip(mix_stft, mask)]
+    sig2_stft = [np.subtract(mix, sig) for mix, sig in zip(mix_stft, sig1_stft)
+                 ]
+    logging.info('Inverse Short-Time Fourier Transformation')
+    # 从频域转换到时域
+    sep_sig1 = _istft(sig1_stft)
+    sep_sig2 = _istft(sig2_stft)
+
+    logging.info("write test audio into dir %s" % config.DATA_TEST_MIX_ROOT)
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    for ss, sn, f in zip(sep_sig1, sep_sig2, file_list):
+        sf.write(f + '.sep.sig1.wav', ss, config.SAMPLE_RATE)
+        sf.write(f + '.sep.sig2.wav', sn, config.SAMPLE_RATE)
+
+    logging.info('run bss evaluation')
+    sdr, sir, sar = _bss_eval()
+    logging.info('SDR: %g, SIR: %g, SAR: %g' % (sdr, sir, sar))
+
+
+def _build_ibm(sig1, sig2):
+    # 创建 ideal binary mask
+    # TODO deal with snr != 0
+    ibm = []
+    for s1, s2 in zip(sig1, sig2):
+        s1, s2 = np.abs(s1), np.abs(s2)
+        # bool object has no astype attribute
+        i = (s1 > s2).astype(np.float64)
+        ibm.append(i)
+    return ibm
+
+
+def _istft(stft_matrix_list):
+    '''
+    Inverse Short-Time Fourier Transformation
+    '''
+    audios = []
+    for sm in stft_matrix_list:
+        sm = np.transpose(sm)
+        ad = stft.ispectrogram(sm, framelength=config.STFT_POINT,
+                               overlap=config.STFT_OVERLAP)
+        audios.append(ad)
+    return audios
+
+
+def _bss_eval():
+    '''
+    通过调用Matlab BSS_EVAL工具进行表现评估
+    :return: sdr、sir、sar三个指标均值
+    '''
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    logging.info('connect to matlab')
+
+    avg_sdr, avg_sir, avg_sar = 0., 0., 0.
+    eng = matlab.engine.start_matlab()
+
+    for filepath in file_list:
+        sig1_wav = filepath + '.sig1.wav'
+        sig2_wav = filepath + '.sig2.wav'
+        sep_sig1_wav = filepath + '.sep.sig1.wav'
+        sep_sig2_wav = filepath + '.sep.sig2.wav'
+        mix_wav = filepath + '.mix.wav'
+        # matlab执行bss_eval.m
+        sdr, sir, sar = eng.bss_eval(sig1_wav, sig2_wav, sep_sig1_wav,
+                                     sep_sig2_wav, mix_wav, nargout=3)
+        avg_sdr += sdr / len(file_list)
+        avg_sir += sir / len(file_list)
+        avg_sar += sar / len(file_list)
+
+    return avg_sdr, avg_sir, avg_sar
+
+
+def _separate(X_list):
+    # 把 X_list 的每行均分成两半
+    a, b = [], []
+    for X in X_list:
+        a.append([row[:int(len(row) / 2)] for row in X])
+        b.append([row[int(len(row) / 2):] for row in X])
+
+    return a, b
+
+
+def _gen_mix_filename(sig1_list_csv, sig2_path, mix_dir):
+    '''
+    生成混合音频文件的路径str
+    :param sig1_list_csv: csv文件，第一列记录音频文件名
+    :param sig2_path: 另一个音源文件目录
+    :param mix_dir: 混合音频保存目录
+    :return:
+    '''
+    mix_file_list = []
+    signals_file_list = util.read_csv(sig1_list_csv)
+    sig2_fillename = os.path.basename(sig2_path).split('.')[0]
+    for sig1_file in signals_file_list:
+        sig1_filename = os.path.splitext(sig1_file[0])[0]
+        mix_file_list.append('%s/%s+%s' %
+                             (mix_dir, sig1_filename, sig2_fillename))
+    return mix_file_list
+
+
+def log_config():
+    with open(config.LOG_FILENAME, 'a', encoding='utf-8') as log:
+        log.write('config.py-----------------------------------------------\n')
+        with open('config.py', 'r', encoding='utf-8') as cf:
+            for line in cf:
+                log.write(line)
+        log.write('\n\n')
+        log.write('%s---------------------------------------------------\n'
+                  % config.RUN_SCRIPT)
+        with open(config.RUN_SCRIPT, 'r', encoding='utf-8') as scp:
+            for line in scp:
+                log.write(line)
+        log.write('\n\n')
+
+
+if __name__ == "__main__":
+    log_config()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TRAIN_ROOT)
+    util.create_more_signals(config.DATA_TRAIN_LOOP_SIGNAL,
+                             config.DATA_TRAIN_ROOT, config.DATA_TRAIN_LIST)
+    train()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TEST_ROOT)
+    util.create_more_signals(config.DATA_TEST_LOOP_SIGNAL,
+                             config.DATA_TEST_ROOT,
+                             config.DATA_TEST_LIST)
+    test()
+
+
+2017-03-17 09:50:50,095::INFO::create train loop signals
+2017-03-17 09:50:50,401::INFO::train bss model
+2017-03-17 09:50:50,827::INFO::mix signals
+2017-03-17 09:50:51,721::INFO::extract stft features
+2017-03-17 09:50:56,393::INFO::train neural network
+2017-03-17 09:51:55,930::INFO::train neural network with 45 sample(s)
+2017-03-17 09:51:57,903::INFO::Epoch: 0001 cost= 25.577328534
+2017-03-17 09:51:59,437::INFO::Epoch: 0002 cost= 15.693361092
+2017-03-17 09:52:01,549::INFO::Epoch: 0003 cost= 10.650768979
+2017-03-17 09:52:03,472::INFO::Epoch: 0004 cost= 7.706450494
+2017-03-17 09:52:05,585::INFO::Epoch: 0005 cost= 5.836886417
+2017-03-17 09:52:07,661::INFO::Epoch: 0006 cost= 4.613403553
+2017-03-17 09:52:09,148::INFO::Epoch: 0007 cost= 3.747663021
+2017-03-17 09:52:11,067::INFO::Epoch: 0008 cost= 3.099982484
+2017-03-17 09:52:13,413::INFO::Epoch: 0009 cost= 2.652285189
+2017-03-17 09:52:15,292::INFO::Epoch: 0010 cost= 2.281333796
+config.py-----------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+运行参数配置，包括日志，数据文件，模型文件，模型参数等
+"""
+
+import logging
+import inspect
+import os
+
+################################
+# 日志配置
+_run_script = inspect.stack()[-1][1]
+# 运行脚本名
+RUN_SCRIPT = os.path.basename(_run_script)
+_run_script_no_ext = os.path.splitext(RUN_SCRIPT)[0]
+# 日志文件名
+LOG_FILENAME = '%s.log' % _run_script_no_ext
+
+# 配置日志输出文件及级别
+FORMAT = '%(asctime)s::%(levelname)s::%(message)s'
+logging.basicConfig(filename=LOG_FILENAME, level=logging.INFO, format=FORMAT,
+                    filemode='a')
+
+# 同时输出到控制台
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter(FORMAT))
+logging.getLogger('').addHandler(console)
+
+################################
+# 数据目录与文件路径
+# 数据根目录
+DATA_ROOT = './data'
+
+# 训练数据
+DATA_TRAIN_ROOT = DATA_ROOT + '/male_train'
+# csv文件，第一列为训练wav文件名
+DATA_TRAIN_LIST = DATA_TRAIN_ROOT + '/data.csv'
+# 混合后数据目录
+DATA_TRAIN_MIX_ROOT = DATA_ROOT + '/train.mix'
+
+# 测试数据，参考训练数据
+DATA_TEST_ROOT = DATA_ROOT + '/male_test'
+DATA_TEST_LIST = DATA_TEST_ROOT + '/data.csv'
+DATA_TEST_MIX_ROOT = DATA_ROOT + '/test.mix'
+
+# 用于循环得到更多的信号
+DATA_TRAIN_LOOP_SIGNAL = DATA_ROOT + '/male_train.wav'
+DATA_TEST_LOOP_SIGNAL = DATA_ROOT + '/male_test.wav'
+
+# 训练与测试信号
+DATA_TRAIN_STATIC_SIGNAL = DATA_ROOT + '/female_train.wav'
+DATA_TEST_STATIC_SIGNAL = DATA_ROOT + '/female_test.wav'
+
+################################
+# 模型存放目录与文件路径
+MODEL_ROOT = './model'
+# 神经网络模型
+MODEL_NN_PATH = MODEL_ROOT + '/neural_net.model'
+
+################################
+# 训练参数配置
+# wav采样率
+SAMPLE_RATE = 16000
+# STFT每帧点数
+STFT_POINT = 1024
+# STFT每帧重叠 1/DN_STFT_OVERLAP
+STFT_OVERLAP = 2
+# 神经网络隐藏层每层激活元数量
+LAYER_SIZE = [16]
+# 模型训练次数
+EPOCH = 100
+# 神经网络输入，每帧前/后扩展数
+EXTEND_NUM = 0
+# 神经网络学习速率
+LEARNING_RATE = 0.001
+# 是否正则化
+NORMALIZATION = True
+
+
+dnn4bss.py---------------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+基于神经网络的盲源分离模型
+
+参考：
+P.-S. Huang, M. Kim, M. Hasegawa-Johnson, P. Smaragdis, "Deep Learning for
+Monaural Speech Separation,"
+in IEEE International Conference on Acoustic,
+Speech and Signal Processing 2014.
+"""
+
+import matlab.engine
+import config
+import logging
+import util
+import os
+import numpy as np
+import nn
+import soundfile as sf
+import stft
+
+
+def train():
+    logging.info('train bss model')
+    sig1_list = util.load_data(config.DATA_TRAIN_LIST, config.DATA_TRAIN_ROOT)
+    sig2 = util.read_wav(config.DATA_TRAIN_STATIC_SIGNAL)
+
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TRAIN_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TRAIN_LIST,
+                                      config.DATA_TRAIN_STATIC_SIGNAL,
+                                      config.DATA_TRAIN_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list, sig2_list,
+                                              output=mix_filenames)
+
+    logging.info('extract stft features')
+    sig1_stft = _extract_stft(sig1_list)
+    sig2_stft = _extract_stft(sig2_list)
+    mix_stft = _extract_stft(mix_list)
+    print('sig1_stft shape is', sig1_stft)
+    print('sig2_stft shape is', sig1_stft)
+    print('mix_stft shape is', mix_stft)
+
+    logging.info('train neural network')
+    sig1_stft = util.r_abs(sig1_stft)
+    sig2_stft = util.r_abs(sig2_stft)
+    mix_stft = util.r_abs(mix_stft)
+
+    train_x, train_y = mix_stft, []
+    for s, n in zip(sig1_stft, sig2_stft):  # 将signal和noise拼接作为nn输出
+        train_y.append(np.concatenate((s, n), axis=1))
+    train_x = [_extend(sig, config.EXTEND_NUM) for sig in train_x]
+
+    # 各层神经元数量
+    layer_size = [len(train_x[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(train_y[0][0]))  # 输出层
+
+    dnn = nn.NNet(layer_size)
+    util.mkdir_p(config.MODEL_ROOT)
+    dnn.train(train_x, train_y, model_path=config.MODEL_NN_PATH,
+              training_epochs=config.EPOCH, learning_rate=config.LEARNING_RATE)
+    # dnn.test(train_x, train_y, model_path=config.MODEL_DN_NN_PATH)
+
+
+def _normalize(sig):
+    sig = np.array(sig)
+    return sig / np.sqrt(np.sum(sig ** 2))
+
+
+def _extend(sig, increment):
+    '''
+    将每帧与前后帧连结
+    :param sig: 信号
+    :param increment: 前/后连结帧数量
+    :return:
+    '''
+    recurrent_train_x = []
+    for i in range(len(sig)):  # 帧数
+        temp = []
+        for k in range(i - increment, i + increment + 1):
+            if k < 0 or k >= len(sig):
+                temp.extend(np.zeros(len(sig[i])))
+            else:
+                temp.extend(sig[k])
+        temp_2 = np.array(temp)
+        recurrent_train_x.append(temp_2)
+    return recurrent_train_x
+
+
+def _extract_stft(audios):
+    stfts = []
+    for ad in audios:
+        st = stft.spectrogram(ad, framelength=config.STFT_POINT,
+                              overlap=config.STFT_OVERLAP)
+        st = st.transpose()
+        stfts.append(st)
+    return stfts
+
+
+def test():
+    logging.info('test denoising model')
+    logging.info("read test signal according to %s, read noise from %s" %
+                 (config.DATA_TEST_LIST, config.DATA_TEST_STATIC_SIGNAL))
+    sig1_list = util.load_data(config.DATA_TEST_LIST, config.DATA_TEST_ROOT)
+    sig2 = util.read_wav(config.DATA_TEST_STATIC_SIGNAL)
+
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TEST_LIST,
+                                      config.DATA_TEST_STATIC_SIGNAL,
+                                      config.DATA_TEST_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list,
+                                              sig2_list, output=mix_filenames)
+
+    logging.info('extract stft features')
+    mix_stft = _extract_stft(mix_list)
+
+    mix_data = util.r_abs(mix_stft)
+    mix_data = [_extend(sig, config.EXTEND_NUM) for sig in mix_data]
+
+    logging.info('run neural network')
+    # 各层神经元数量
+    layer_size = [len(mix_data[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(mix_stft[0][0]) * 2)  # 输出层
+    dnn = nn.NNet(layer_size)
+    sig1_sig2 = dnn.run(mix_data, model_path=config.MODEL_NN_PATH)
+    # 神经网络输出为预测signal1与signal2的拼接，此处分离
+    sig1_stft, sig2_stft = _separate(sig1_sig2)
+
+    logging.info('Time-Frequency Masking')
+    mask = []
+    for s, n in zip(sig1_stft, sig2_stft):
+        mask.append(_build_ibm(s, n))
+    sig1_stft = [np.multiply(mix, m) for mix, m in zip(mix_stft, mask)]
+    sig2_stft = [np.subtract(mix, sig) for mix, sig in zip(mix_stft, sig1_stft)
+                 ]
+    logging.info('Inverse Short-Time Fourier Transformation')
+    # 从频域转换到时域
+    sep_sig1 = _istft(sig1_stft)
+    sep_sig2 = _istft(sig2_stft)
+
+    logging.info("write test audio into dir %s" % config.DATA_TEST_MIX_ROOT)
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    for ss, sn, f in zip(sep_sig1, sep_sig2, file_list):
+        sf.write(f + '.sep.sig1.wav', ss, config.SAMPLE_RATE)
+        sf.write(f + '.sep.sig2.wav', sn, config.SAMPLE_RATE)
+
+    logging.info('run bss evaluation')
+    sdr, sir, sar = _bss_eval()
+    logging.info('SDR: %g, SIR: %g, SAR: %g' % (sdr, sir, sar))
+
+
+def _build_ibm(sig1, sig2):
+    # 创建 ideal binary mask
+    # TODO deal with snr != 0
+    ibm = []
+    for s1, s2 in zip(sig1, sig2):
+        s1, s2 = np.abs(s1), np.abs(s2)
+        # bool object has no astype attribute
+        i = (s1 > s2).astype(np.float64)
+        ibm.append(i)
+    return ibm
+
+
+def _istft(stft_matrix_list):
+    '''
+    Inverse Short-Time Fourier Transformation
+    '''
+    audios = []
+    for sm in stft_matrix_list:
+        sm = np.transpose(sm)
+        ad = stft.ispectrogram(sm, framelength=config.STFT_POINT,
+                               overlap=config.STFT_OVERLAP)
+        audios.append(ad)
+    return audios
+
+
+def _bss_eval():
+    '''
+    通过调用Matlab BSS_EVAL工具进行表现评估
+    :return: sdr、sir、sar三个指标均值
+    '''
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    logging.info('connect to matlab')
+
+    avg_sdr, avg_sir, avg_sar = 0., 0., 0.
+    eng = matlab.engine.start_matlab()
+
+    for filepath in file_list:
+        sig1_wav = filepath + '.sig1.wav'
+        sig2_wav = filepath + '.sig2.wav'
+        sep_sig1_wav = filepath + '.sep.sig1.wav'
+        sep_sig2_wav = filepath + '.sep.sig2.wav'
+        mix_wav = filepath + '.mix.wav'
+        # matlab执行bss_eval.m
+        sdr, sir, sar = eng.bss_eval(sig1_wav, sig2_wav, sep_sig1_wav,
+                                     sep_sig2_wav, mix_wav, nargout=3)
+        avg_sdr += sdr / len(file_list)
+        avg_sir += sir / len(file_list)
+        avg_sar += sar / len(file_list)
+
+    return avg_sdr, avg_sir, avg_sar
+
+
+def _separate(X_list):
+    # 把 X_list 的每行均分成两半
+    a, b = [], []
+    for X in X_list:
+        a.append([row[:int(len(row) / 2)] for row in X])
+        b.append([row[int(len(row) / 2):] for row in X])
+
+    return a, b
+
+
+def _gen_mix_filename(sig1_list_csv, sig2_path, mix_dir):
+    '''
+    生成混合音频文件的路径str
+    :param sig1_list_csv: csv文件，第一列记录音频文件名
+    :param sig2_path: 另一个音源文件目录
+    :param mix_dir: 混合音频保存目录
+    :return:
+    '''
+    mix_file_list = []
+    signals_file_list = util.read_csv(sig1_list_csv)
+    sig2_fillename = os.path.basename(sig2_path).split('.')[0]
+    for sig1_file in signals_file_list:
+        sig1_filename = os.path.splitext(sig1_file[0])[0]
+        mix_file_list.append('%s/%s+%s' %
+                             (mix_dir, sig1_filename, sig2_fillename))
+    return mix_file_list
+
+
+def log_config():
+    with open(config.LOG_FILENAME, 'a', encoding='utf-8') as log:
+        log.write('config.py-----------------------------------------------\n')
+        with open('config.py', 'r', encoding='utf-8') as cf:
+            for line in cf:
+                log.write(line)
+        log.write('\n\n')
+        log.write('%s---------------------------------------------------\n'
+                  % config.RUN_SCRIPT)
+        with open(config.RUN_SCRIPT, 'r', encoding='utf-8') as scp:
+            for line in scp:
+                log.write(line)
+        log.write('\n\n')
+
+
+if __name__ == "__main__":
+    log_config()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TRAIN_ROOT)
+    util.create_more_signals(config.DATA_TRAIN_LOOP_SIGNAL,
+                             config.DATA_TRAIN_ROOT, config.DATA_TRAIN_LIST)
+    train()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TEST_ROOT)
+    util.create_more_signals(config.DATA_TEST_LOOP_SIGNAL,
+                             config.DATA_TEST_ROOT,
+                             config.DATA_TEST_LIST)
+    test()
+
+
+2017-03-17 09:53:14,592::INFO::create train loop signals
+2017-03-17 09:53:14,865::INFO::train bss model
+2017-03-17 09:53:15,203::INFO::mix signals
+2017-03-17 09:53:15,978::INFO::extract stft features
+2017-03-17 09:53:20,385::INFO::train neural network
+config.py-----------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+运行参数配置，包括日志，数据文件，模型文件，模型参数等
+"""
+
+import logging
+import inspect
+import os
+
+################################
+# 日志配置
+_run_script = inspect.stack()[-1][1]
+# 运行脚本名
+RUN_SCRIPT = os.path.basename(_run_script)
+_run_script_no_ext = os.path.splitext(RUN_SCRIPT)[0]
+# 日志文件名
+LOG_FILENAME = '%s.log' % _run_script_no_ext
+
+# 配置日志输出文件及级别
+FORMAT = '%(asctime)s::%(levelname)s::%(message)s'
+logging.basicConfig(filename=LOG_FILENAME, level=logging.INFO, format=FORMAT,
+                    filemode='a')
+
+# 同时输出到控制台
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter(FORMAT))
+logging.getLogger('').addHandler(console)
+
+################################
+# 数据目录与文件路径
+# 数据根目录
+DATA_ROOT = './data'
+
+# 训练数据
+DATA_TRAIN_ROOT = DATA_ROOT + '/male_train'
+# csv文件，第一列为训练wav文件名
+DATA_TRAIN_LIST = DATA_TRAIN_ROOT + '/data.csv'
+# 混合后数据目录
+DATA_TRAIN_MIX_ROOT = DATA_ROOT + '/train.mix'
+
+# 测试数据，参考训练数据
+DATA_TEST_ROOT = DATA_ROOT + '/male_test'
+DATA_TEST_LIST = DATA_TEST_ROOT + '/data.csv'
+DATA_TEST_MIX_ROOT = DATA_ROOT + '/test.mix'
+
+# 用于循环得到更多的信号
+DATA_TRAIN_LOOP_SIGNAL = DATA_ROOT + '/male_train.wav'
+DATA_TEST_LOOP_SIGNAL = DATA_ROOT + '/male_test.wav'
+
+# 训练与测试信号
+DATA_TRAIN_STATIC_SIGNAL = DATA_ROOT + '/female_train.wav'
+DATA_TEST_STATIC_SIGNAL = DATA_ROOT + '/female_test.wav'
+
+################################
+# 模型存放目录与文件路径
+MODEL_ROOT = './model'
+# 神经网络模型
+MODEL_NN_PATH = MODEL_ROOT + '/neural_net.model'
+
+################################
+# 训练参数配置
+# wav采样率
+SAMPLE_RATE = 16000
+# STFT每帧点数
+STFT_POINT = 1024
+# STFT每帧重叠 1/DN_STFT_OVERLAP
+STFT_OVERLAP = 2
+# 神经网络隐藏层每层激活元数量
+LAYER_SIZE = [16]
+# 模型训练次数
+EPOCH = 100
+# 神经网络输入，每帧前/后扩展数
+EXTEND_NUM = 0
+# 神经网络学习速率
+LEARNING_RATE = 0.001
+# 是否正则化
+NORMALIZATION = True
+
+
+dnn4bss.py---------------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+基于神经网络的盲源分离模型
+
+参考：
+P.-S. Huang, M. Kim, M. Hasegawa-Johnson, P. Smaragdis, "Deep Learning for
+Monaural Speech Separation,"
+in IEEE International Conference on Acoustic,
+Speech and Signal Processing 2014.
+"""
+
+import matlab.engine
+import config
+import logging
+import util
+import os
+import numpy as np
+import nn
+import soundfile as sf
+import stft
+
+
+def train():
+    logging.info('train bss model')
+    sig1_list = util.load_data(config.DATA_TRAIN_LIST, config.DATA_TRAIN_ROOT)
+    sig2 = util.read_wav(config.DATA_TRAIN_STATIC_SIGNAL)
+
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TRAIN_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TRAIN_LIST,
+                                      config.DATA_TRAIN_STATIC_SIGNAL,
+                                      config.DATA_TRAIN_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list, sig2_list,
+                                              output=mix_filenames)
+
+    logging.info('extract stft features')
+    # sig1_stft = _extract_stft(sig1_list)
+    # sig2_stft = _extract_stft(sig2_list)
+    # mix_stft = _extract_stft(mix_list)
+    sig1_stft = eng.MRCG_features(matlab.double(sig1_list), 16000)
+    sig2_stf = eng.MRCG_features(matlab.double(sig2_list), 16000)
+    mix_stft = eng.MRCG_features(matlab.double(mix_list), 16000)
+    
+
+    logging.info('train neural network')
+    sig1_stft = util.r_abs(sig1_stft)
+    sig2_stft = util.r_abs(sig2_stft)
+    mix_stft = util.r_abs(mix_stft)
+    train_x, train_y = mix_stft, []
+    for s, n in zip(sig1_stft, sig2_stft):  # 将signal和noise拼接作为nn输出
+        train_y.append(np.concatenate((s, n), axis=1))
+    train_x = [_extend(sig, config.EXTEND_NUM) for sig in train_x]
+
+    # 各层神经元数量
+    layer_size = [len(train_x[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(train_y[0][0]))  # 输出层
+
+    dnn = nn.NNet(layer_size)
+    util.mkdir_p(config.MODEL_ROOT)
+    dnn.train(train_x, train_y, model_path=config.MODEL_NN_PATH,
+              training_epochs=config.EPOCH, learning_rate=config.LEARNING_RATE)
+    # dnn.test(train_x, train_y, model_path=config.MODEL_DN_NN_PATH)
+
+
+def _normalize(sig):
+    sig = np.array(sig)
+    return sig / np.sqrt(np.sum(sig ** 2))
+
+
+def _extend(sig, increment):
+    '''
+    将每帧与前后帧连结
+    :param sig: 信号
+    :param increment: 前/后连结帧数量
+    :return:
+    '''
+    recurrent_train_x = []
+    for i in range(len(sig)):  # 帧数
+        temp = []
+        for k in range(i - increment, i + increment + 1):
+            if k < 0 or k >= len(sig):
+                temp.extend(np.zeros(len(sig[i])))
+            else:
+                temp.extend(sig[k])
+        temp_2 = np.array(temp)
+        recurrent_train_x.append(temp_2)
+    return recurrent_train_x
+
+
+def _extract_stft(audios):
+    stfts = []
+    for ad in audios:
+        st = stft.spectrogram(ad, framelength=config.STFT_POINT,
+                              overlap=config.STFT_OVERLAP)
+        st = st.transpose()
+        stfts.append(st)
+    return stfts
+
+
+def test():
+    logging.info('test denoising model')
+    logging.info("read test signal according to %s, read noise from %s" %
+                 (config.DATA_TEST_LIST, config.DATA_TEST_STATIC_SIGNAL))
+    sig1_list = util.load_data(config.DATA_TEST_LIST, config.DATA_TEST_ROOT)
+    sig2 = util.read_wav(config.DATA_TEST_STATIC_SIGNAL)
+
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TEST_LIST,
+                                      config.DATA_TEST_STATIC_SIGNAL,
+                                      config.DATA_TEST_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list,
+                                              sig2_list, output=mix_filenames)
+
+    logging.info('extract stft features')
+    mix_stft = _extract_stft(mix_list)
+
+    mix_data = util.r_abs(mix_stft)
+    mix_data = [_extend(sig, config.EXTEND_NUM) for sig in mix_data]
+
+    logging.info('run neural network')
+    # 各层神经元数量
+    layer_size = [len(mix_data[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(mix_stft[0][0]) * 2)  # 输出层
+    dnn = nn.NNet(layer_size)
+    sig1_sig2 = dnn.run(mix_data, model_path=config.MODEL_NN_PATH)
+    # 神经网络输出为预测signal1与signal2的拼接，此处分离
+    sig1_stft, sig2_stft = _separate(sig1_sig2)
+
+    logging.info('Time-Frequency Masking')
+    mask = []
+    for s, n in zip(sig1_stft, sig2_stft):
+        mask.append(_build_ibm(s, n))
+    sig1_stft = [np.multiply(mix, m) for mix, m in zip(mix_stft, mask)]
+    sig2_stft = [np.subtract(mix, sig) for mix, sig in zip(mix_stft, sig1_stft)
+                 ]
+    logging.info('Inverse Short-Time Fourier Transformation')
+    # 从频域转换到时域
+    sep_sig1 = _istft(sig1_stft)
+    sep_sig2 = _istft(sig2_stft)
+
+    logging.info("write test audio into dir %s" % config.DATA_TEST_MIX_ROOT)
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    for ss, sn, f in zip(sep_sig1, sep_sig2, file_list):
+        sf.write(f + '.sep.sig1.wav', ss, config.SAMPLE_RATE)
+        sf.write(f + '.sep.sig2.wav', sn, config.SAMPLE_RATE)
+
+    logging.info('run bss evaluation')
+    sdr, sir, sar = _bss_eval()
+    logging.info('SDR: %g, SIR: %g, SAR: %g' % (sdr, sir, sar))
+
+
+def _build_ibm(sig1, sig2):
+    # 创建 ideal binary mask
+    # TODO deal with snr != 0
+    ibm = []
+    for s1, s2 in zip(sig1, sig2):
+        s1, s2 = np.abs(s1), np.abs(s2)
+        # bool object has no astype attribute
+        i = (s1 > s2).astype(np.float64)
+        ibm.append(i)
+    return ibm
+
+
+def _istft(stft_matrix_list):
+    '''
+    Inverse Short-Time Fourier Transformation
+    '''
+    audios = []
+    for sm in stft_matrix_list:
+        sm = np.transpose(sm)
+        ad = stft.ispectrogram(sm, framelength=config.STFT_POINT,
+                               overlap=config.STFT_OVERLAP)
+        audios.append(ad)
+    return audios
+
+
+def _bss_eval():
+    '''
+    通过调用Matlab BSS_EVAL工具进行表现评估
+    :return: sdr、sir、sar三个指标均值
+    '''
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    logging.info('connect to matlab')
+
+    avg_sdr, avg_sir, avg_sar = 0., 0., 0.
+    eng = matlab.engine.start_matlab()
+
+    for filepath in file_list:
+        sig1_wav = filepath + '.sig1.wav'
+        sig2_wav = filepath + '.sig2.wav'
+        sep_sig1_wav = filepath + '.sep.sig1.wav'
+        sep_sig2_wav = filepath + '.sep.sig2.wav'
+        mix_wav = filepath + '.mix.wav'
+        # matlab执行bss_eval.m
+        sdr, sir, sar = eng.bss_eval(sig1_wav, sig2_wav, sep_sig1_wav,
+                                     sep_sig2_wav, mix_wav, nargout=3)
+        avg_sdr += sdr / len(file_list)
+        avg_sir += sir / len(file_list)
+        avg_sar += sar / len(file_list)
+
+    return avg_sdr, avg_sir, avg_sar
+
+
+def _separate(X_list):
+    # 把 X_list 的每行均分成两半
+    a, b = [], []
+    for X in X_list:
+        a.append([row[:int(len(row) / 2)] for row in X])
+        b.append([row[int(len(row) / 2):] for row in X])
+
+    return a, b
+
+
+def _gen_mix_filename(sig1_list_csv, sig2_path, mix_dir):
+    '''
+    生成混合音频文件的路径str
+    :param sig1_list_csv: csv文件，第一列记录音频文件名
+    :param sig2_path: 另一个音源文件目录
+    :param mix_dir: 混合音频保存目录
+    :return:
+    '''
+    mix_file_list = []
+    signals_file_list = util.read_csv(sig1_list_csv)
+    sig2_fillename = os.path.basename(sig2_path).split('.')[0]
+    for sig1_file in signals_file_list:
+        sig1_filename = os.path.splitext(sig1_file[0])[0]
+        mix_file_list.append('%s/%s+%s' %
+                             (mix_dir, sig1_filename, sig2_fillename))
+    return mix_file_list
+
+
+def log_config():
+    with open(config.LOG_FILENAME, 'a', encoding='utf-8') as log:
+        log.write('config.py-----------------------------------------------\n')
+        with open('config.py', 'r', encoding='utf-8') as cf:
+            for line in cf:
+                log.write(line)
+        log.write('\n\n')
+        log.write('%s---------------------------------------------------\n'
+                  % config.RUN_SCRIPT)
+        with open(config.RUN_SCRIPT, 'r', encoding='utf-8') as scp:
+            for line in scp:
+                log.write(line)
+        log.write('\n\n')
+
+
+if __name__ == "__main__":
+    log_config()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TRAIN_ROOT)
+    util.create_more_signals(config.DATA_TRAIN_LOOP_SIGNAL,
+                             config.DATA_TRAIN_ROOT, config.DATA_TRAIN_LIST)
+    train()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TEST_ROOT)
+    util.create_more_signals(config.DATA_TEST_LOOP_SIGNAL,
+                             config.DATA_TEST_ROOT,
+                             config.DATA_TEST_LIST)
+    test()
+
+
+2017-03-17 10:11:18,973::INFO::create train loop signals
+2017-03-17 10:11:19,176::INFO::train bss model
+2017-03-17 10:11:19,496::INFO::mix signals
+2017-03-17 10:11:20,389::INFO::extract stft features
+config.py-----------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+运行参数配置，包括日志，数据文件，模型文件，模型参数等
+"""
+
+import logging
+import inspect
+import os
+
+################################
+# 日志配置
+_run_script = inspect.stack()[-1][1]
+# 运行脚本名
+RUN_SCRIPT = os.path.basename(_run_script)
+_run_script_no_ext = os.path.splitext(RUN_SCRIPT)[0]
+# 日志文件名
+LOG_FILENAME = '%s.log' % _run_script_no_ext
+
+# 配置日志输出文件及级别
+FORMAT = '%(asctime)s::%(levelname)s::%(message)s'
+logging.basicConfig(filename=LOG_FILENAME, level=logging.INFO, format=FORMAT,
+                    filemode='a')
+
+# 同时输出到控制台
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter(FORMAT))
+logging.getLogger('').addHandler(console)
+
+################################
+# 数据目录与文件路径
+# 数据根目录
+DATA_ROOT = './data'
+
+# 训练数据
+DATA_TRAIN_ROOT = DATA_ROOT + '/male_train'
+# csv文件，第一列为训练wav文件名
+DATA_TRAIN_LIST = DATA_TRAIN_ROOT + '/data.csv'
+# 混合后数据目录
+DATA_TRAIN_MIX_ROOT = DATA_ROOT + '/train.mix'
+
+# 测试数据，参考训练数据
+DATA_TEST_ROOT = DATA_ROOT + '/male_test'
+DATA_TEST_LIST = DATA_TEST_ROOT + '/data.csv'
+DATA_TEST_MIX_ROOT = DATA_ROOT + '/test.mix'
+
+# 用于循环得到更多的信号
+DATA_TRAIN_LOOP_SIGNAL = DATA_ROOT + '/male_train.wav'
+DATA_TEST_LOOP_SIGNAL = DATA_ROOT + '/male_test.wav'
+
+# 训练与测试信号
+DATA_TRAIN_STATIC_SIGNAL = DATA_ROOT + '/female_train.wav'
+DATA_TEST_STATIC_SIGNAL = DATA_ROOT + '/female_test.wav'
+
+################################
+# 模型存放目录与文件路径
+MODEL_ROOT = './model'
+# 神经网络模型
+MODEL_NN_PATH = MODEL_ROOT + '/neural_net.model'
+
+################################
+# 训练参数配置
+# wav采样率
+SAMPLE_RATE = 16000
+# STFT每帧点数
+STFT_POINT = 1024
+# STFT每帧重叠 1/DN_STFT_OVERLAP
+STFT_OVERLAP = 2
+# 神经网络隐藏层每层激活元数量
+LAYER_SIZE = [16]
+# 模型训练次数
+EPOCH = 100
+# 神经网络输入，每帧前/后扩展数
+EXTEND_NUM = 0
+# 神经网络学习速率
+LEARNING_RATE = 0.001
+# 是否正则化
+NORMALIZATION = True
+
+
+dnn4bss.py---------------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+基于神经网络的盲源分离模型
+
+参考：
+P.-S. Huang, M. Kim, M. Hasegawa-Johnson, P. Smaragdis, "Deep Learning for
+Monaural Speech Separation,"
+in IEEE International Conference on Acoustic,
+Speech and Signal Processing 2014.
+"""
+
+import matlab.engine
+import config
+import logging
+import util
+import os
+import numpy as np
+import nn
+import soundfile as sf
+import stft
+
+
+def train():
+    logging.info('train bss model')
+    sig1_list = util.load_data(config.DATA_TRAIN_LIST, config.DATA_TRAIN_ROOT)
+    sig2 = util.read_wav(config.DATA_TRAIN_STATIC_SIGNAL)
+
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TRAIN_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TRAIN_LIST,
+                                      config.DATA_TRAIN_STATIC_SIGNAL,
+                                      config.DATA_TRAIN_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list, sig2_list,
+                                              output=mix_filenames)
+
+    logging.info('extract stft features')
+    # sig1_stft = _extract_stft(sig1_list)
+    # sig2_stft = _extract_stft(sig2_list)
+    # mix_stft = _extract_stft(mix_list)
+    eng = matlab.engine.start_matlab()
+    sig1_stft = eng.MRCG_features(matlab.double(sig1_list), 16000)
+    sig2_stf = eng.MRCG_features(matlab.double(sig2_list), 16000)
+    mix_stft = eng.MRCG_features(matlab.double(mix_list), 16000)
+    
+
+    logging.info('train neural network')
+    sig1_stft = util.r_abs(sig1_stft)
+    sig2_stft = util.r_abs(sig2_stft)
+    mix_stft = util.r_abs(mix_stft)
+    train_x, train_y = mix_stft, []
+    for s, n in zip(sig1_stft, sig2_stft):  # 将signal和noise拼接作为nn输出
+        train_y.append(np.concatenate((s, n), axis=1))
+    train_x = [_extend(sig, config.EXTEND_NUM) for sig in train_x]
+
+    # 各层神经元数量
+    layer_size = [len(train_x[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(train_y[0][0]))  # 输出层
+
+    dnn = nn.NNet(layer_size)
+    util.mkdir_p(config.MODEL_ROOT)
+    dnn.train(train_x, train_y, model_path=config.MODEL_NN_PATH,
+              training_epochs=config.EPOCH, learning_rate=config.LEARNING_RATE)
+    # dnn.test(train_x, train_y, model_path=config.MODEL_DN_NN_PATH)
+
+
+def _normalize(sig):
+    sig = np.array(sig)
+    return sig / np.sqrt(np.sum(sig ** 2))
+
+
+def _extend(sig, increment):
+    '''
+    将每帧与前后帧连结
+    :param sig: 信号
+    :param increment: 前/后连结帧数量
+    :return:
+    '''
+    recurrent_train_x = []
+    for i in range(len(sig)):  # 帧数
+        temp = []
+        for k in range(i - increment, i + increment + 1):
+            if k < 0 or k >= len(sig):
+                temp.extend(np.zeros(len(sig[i])))
+            else:
+                temp.extend(sig[k])
+        temp_2 = np.array(temp)
+        recurrent_train_x.append(temp_2)
+    return recurrent_train_x
+
+
+def _extract_stft(audios):
+    stfts = []
+    for ad in audios:
+        st = stft.spectrogram(ad, framelength=config.STFT_POINT,
+                              overlap=config.STFT_OVERLAP)
+        st = st.transpose()
+        stfts.append(st)
+    return stfts
+
+
+def test():
+    logging.info('test denoising model')
+    logging.info("read test signal according to %s, read noise from %s" %
+                 (config.DATA_TEST_LIST, config.DATA_TEST_STATIC_SIGNAL))
+    sig1_list = util.load_data(config.DATA_TEST_LIST, config.DATA_TEST_ROOT)
+    sig2 = util.read_wav(config.DATA_TEST_STATIC_SIGNAL)
+
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TEST_LIST,
+                                      config.DATA_TEST_STATIC_SIGNAL,
+                                      config.DATA_TEST_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list,
+                                              sig2_list, output=mix_filenames)
+
+    logging.info('extract stft features')
+    mix_stft = _extract_stft(mix_list)
+
+    mix_data = util.r_abs(mix_stft)
+    mix_data = [_extend(sig, config.EXTEND_NUM) for sig in mix_data]
+
+    logging.info('run neural network')
+    # 各层神经元数量
+    layer_size = [len(mix_data[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(mix_stft[0][0]) * 2)  # 输出层
+    dnn = nn.NNet(layer_size)
+    sig1_sig2 = dnn.run(mix_data, model_path=config.MODEL_NN_PATH)
+    # 神经网络输出为预测signal1与signal2的拼接，此处分离
+    sig1_stft, sig2_stft = _separate(sig1_sig2)
+
+    logging.info('Time-Frequency Masking')
+    mask = []
+    for s, n in zip(sig1_stft, sig2_stft):
+        mask.append(_build_ibm(s, n))
+    sig1_stft = [np.multiply(mix, m) for mix, m in zip(mix_stft, mask)]
+    sig2_stft = [np.subtract(mix, sig) for mix, sig in zip(mix_stft, sig1_stft)
+                 ]
+    logging.info('Inverse Short-Time Fourier Transformation')
+    # 从频域转换到时域
+    sep_sig1 = _istft(sig1_stft)
+    sep_sig2 = _istft(sig2_stft)
+
+    logging.info("write test audio into dir %s" % config.DATA_TEST_MIX_ROOT)
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    for ss, sn, f in zip(sep_sig1, sep_sig2, file_list):
+        sf.write(f + '.sep.sig1.wav', ss, config.SAMPLE_RATE)
+        sf.write(f + '.sep.sig2.wav', sn, config.SAMPLE_RATE)
+
+    logging.info('run bss evaluation')
+    sdr, sir, sar = _bss_eval()
+    logging.info('SDR: %g, SIR: %g, SAR: %g' % (sdr, sir, sar))
+
+
+def _build_ibm(sig1, sig2):
+    # 创建 ideal binary mask
+    # TODO deal with snr != 0
+    ibm = []
+    for s1, s2 in zip(sig1, sig2):
+        s1, s2 = np.abs(s1), np.abs(s2)
+        # bool object has no astype attribute
+        i = (s1 > s2).astype(np.float64)
+        ibm.append(i)
+    return ibm
+
+
+def _istft(stft_matrix_list):
+    '''
+    Inverse Short-Time Fourier Transformation
+    '''
+    audios = []
+    for sm in stft_matrix_list:
+        sm = np.transpose(sm)
+        ad = stft.ispectrogram(sm, framelength=config.STFT_POINT,
+                               overlap=config.STFT_OVERLAP)
+        audios.append(ad)
+    return audios
+
+
+def _bss_eval():
+    '''
+    通过调用Matlab BSS_EVAL工具进行表现评估
+    :return: sdr、sir、sar三个指标均值
+    '''
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    logging.info('connect to matlab')
+
+    avg_sdr, avg_sir, avg_sar = 0., 0., 0.
+    eng = matlab.engine.start_matlab()
+
+    for filepath in file_list:
+        sig1_wav = filepath + '.sig1.wav'
+        sig2_wav = filepath + '.sig2.wav'
+        sep_sig1_wav = filepath + '.sep.sig1.wav'
+        sep_sig2_wav = filepath + '.sep.sig2.wav'
+        mix_wav = filepath + '.mix.wav'
+        # matlab执行bss_eval.m
+        sdr, sir, sar = eng.bss_eval(sig1_wav, sig2_wav, sep_sig1_wav,
+                                     sep_sig2_wav, mix_wav, nargout=3)
+        avg_sdr += sdr / len(file_list)
+        avg_sir += sir / len(file_list)
+        avg_sar += sar / len(file_list)
+
+    return avg_sdr, avg_sir, avg_sar
+
+
+def _separate(X_list):
+    # 把 X_list 的每行均分成两半
+    a, b = [], []
+    for X in X_list:
+        a.append([row[:int(len(row) / 2)] for row in X])
+        b.append([row[int(len(row) / 2):] for row in X])
+
+    return a, b
+
+
+def _gen_mix_filename(sig1_list_csv, sig2_path, mix_dir):
+    '''
+    生成混合音频文件的路径str
+    :param sig1_list_csv: csv文件，第一列记录音频文件名
+    :param sig2_path: 另一个音源文件目录
+    :param mix_dir: 混合音频保存目录
+    :return:
+    '''
+    mix_file_list = []
+    signals_file_list = util.read_csv(sig1_list_csv)
+    sig2_fillename = os.path.basename(sig2_path).split('.')[0]
+    for sig1_file in signals_file_list:
+        sig1_filename = os.path.splitext(sig1_file[0])[0]
+        mix_file_list.append('%s/%s+%s' %
+                             (mix_dir, sig1_filename, sig2_fillename))
+    return mix_file_list
+
+
+def log_config():
+    with open(config.LOG_FILENAME, 'a', encoding='utf-8') as log:
+        log.write('config.py-----------------------------------------------\n')
+        with open('config.py', 'r', encoding='utf-8') as cf:
+            for line in cf:
+                log.write(line)
+        log.write('\n\n')
+        log.write('%s---------------------------------------------------\n'
+                  % config.RUN_SCRIPT)
+        with open(config.RUN_SCRIPT, 'r', encoding='utf-8') as scp:
+            for line in scp:
+                log.write(line)
+        log.write('\n\n')
+
+
+if __name__ == "__main__":
+    log_config()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TRAIN_ROOT)
+    util.create_more_signals(config.DATA_TRAIN_LOOP_SIGNAL,
+                             config.DATA_TRAIN_ROOT, config.DATA_TRAIN_LIST)
+    train()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TEST_ROOT)
+    util.create_more_signals(config.DATA_TEST_LOOP_SIGNAL,
+                             config.DATA_TEST_ROOT,
+                             config.DATA_TEST_LIST)
+    test()
+
+
+2017-03-17 10:12:18,722::INFO::create train loop signals
+2017-03-17 10:12:18,922::INFO::train bss model
+2017-03-17 10:12:19,218::INFO::mix signals
+2017-03-17 10:12:20,004::INFO::extract stft features
+config.py-----------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+运行参数配置，包括日志，数据文件，模型文件，模型参数等
+"""
+
+import logging
+import inspect
+import os
+
+################################
+# 日志配置
+_run_script = inspect.stack()[-1][1]
+# 运行脚本名
+RUN_SCRIPT = os.path.basename(_run_script)
+_run_script_no_ext = os.path.splitext(RUN_SCRIPT)[0]
+# 日志文件名
+LOG_FILENAME = '%s.log' % _run_script_no_ext
+
+# 配置日志输出文件及级别
+FORMAT = '%(asctime)s::%(levelname)s::%(message)s'
+logging.basicConfig(filename=LOG_FILENAME, level=logging.INFO, format=FORMAT,
+                    filemode='a')
+
+# 同时输出到控制台
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter(FORMAT))
+logging.getLogger('').addHandler(console)
+
+################################
+# 数据目录与文件路径
+# 数据根目录
+DATA_ROOT = './data'
+
+# 训练数据
+DATA_TRAIN_ROOT = DATA_ROOT + '/male_train'
+# csv文件，第一列为训练wav文件名
+DATA_TRAIN_LIST = DATA_TRAIN_ROOT + '/data.csv'
+# 混合后数据目录
+DATA_TRAIN_MIX_ROOT = DATA_ROOT + '/train.mix'
+
+# 测试数据，参考训练数据
+DATA_TEST_ROOT = DATA_ROOT + '/male_test'
+DATA_TEST_LIST = DATA_TEST_ROOT + '/data.csv'
+DATA_TEST_MIX_ROOT = DATA_ROOT + '/test.mix'
+
+# 用于循环得到更多的信号
+DATA_TRAIN_LOOP_SIGNAL = DATA_ROOT + '/male_train.wav'
+DATA_TEST_LOOP_SIGNAL = DATA_ROOT + '/male_test.wav'
+
+# 训练与测试信号
+DATA_TRAIN_STATIC_SIGNAL = DATA_ROOT + '/female_train.wav'
+DATA_TEST_STATIC_SIGNAL = DATA_ROOT + '/female_test.wav'
+
+################################
+# 模型存放目录与文件路径
+MODEL_ROOT = './model'
+# 神经网络模型
+MODEL_NN_PATH = MODEL_ROOT + '/neural_net.model'
+
+################################
+# 训练参数配置
+# wav采样率
+SAMPLE_RATE = 16000
+# STFT每帧点数
+STFT_POINT = 1024
+# STFT每帧重叠 1/DN_STFT_OVERLAP
+STFT_OVERLAP = 2
+# 神经网络隐藏层每层激活元数量
+LAYER_SIZE = [16]
+# 模型训练次数
+EPOCH = 100
+# 神经网络输入，每帧前/后扩展数
+EXTEND_NUM = 0
+# 神经网络学习速率
+LEARNING_RATE = 0.001
+# 是否正则化
+NORMALIZATION = True
+
+
+dnn4bss.py---------------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+基于神经网络的盲源分离模型
+
+参考：
+P.-S. Huang, M. Kim, M. Hasegawa-Johnson, P. Smaragdis, "Deep Learning for
+Monaural Speech Separation,"
+in IEEE International Conference on Acoustic,
+Speech and Signal Processing 2014.
+"""
+
+import matlab.engine
+import config
+import logging
+import util
+import os
+import numpy as np
+import nn
+import soundfile as sf
+import stft
+
+
+def train():
+    logging.info('train bss model')
+    sig1_list = util.load_data(config.DATA_TRAIN_LIST, config.DATA_TRAIN_ROOT)
+    sig2 = util.read_wav(config.DATA_TRAIN_STATIC_SIGNAL)
+
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TRAIN_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TRAIN_LIST,
+                                      config.DATA_TRAIN_STATIC_SIGNAL,
+                                      config.DATA_TRAIN_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list, sig2_list,
+                                              output=mix_filenames)
+
+    logging.info('extract stft features')
+    # sig1_stft = _extract_stft(sig1_list)
+    # sig2_stft = _extract_stft(sig2_list)
+    # mix_stft = _extract_stft(mix_list)
+    eng = matlab.engine.start_matlab()
+    sig1_stft = eng.MRCG_features((sig1_list), 16000)
+    sig2_stf = eng.MRCG_features((sig2_list), 16000)
+    mix_stft = eng.MRCG_features((mix_list), 16000)
+    
+
+    logging.info('train neural network')
+    sig1_stft = util.r_abs(sig1_stft)
+    sig2_stft = util.r_abs(sig2_stft)
+    mix_stft = util.r_abs(mix_stft)
+    train_x, train_y = mix_stft, []
+    for s, n in zip(sig1_stft, sig2_stft):  # 将signal和noise拼接作为nn输出
+        train_y.append(np.concatenate((s, n), axis=1))
+    train_x = [_extend(sig, config.EXTEND_NUM) for sig in train_x]
+
+    # 各层神经元数量
+    layer_size = [len(train_x[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(train_y[0][0]))  # 输出层
+
+    dnn = nn.NNet(layer_size)
+    util.mkdir_p(config.MODEL_ROOT)
+    dnn.train(train_x, train_y, model_path=config.MODEL_NN_PATH,
+              training_epochs=config.EPOCH, learning_rate=config.LEARNING_RATE)
+    # dnn.test(train_x, train_y, model_path=config.MODEL_DN_NN_PATH)
+
+
+def _normalize(sig):
+    sig = np.array(sig)
+    return sig / np.sqrt(np.sum(sig ** 2))
+
+
+def _extend(sig, increment):
+    '''
+    将每帧与前后帧连结
+    :param sig: 信号
+    :param increment: 前/后连结帧数量
+    :return:
+    '''
+    recurrent_train_x = []
+    for i in range(len(sig)):  # 帧数
+        temp = []
+        for k in range(i - increment, i + increment + 1):
+            if k < 0 or k >= len(sig):
+                temp.extend(np.zeros(len(sig[i])))
+            else:
+                temp.extend(sig[k])
+        temp_2 = np.array(temp)
+        recurrent_train_x.append(temp_2)
+    return recurrent_train_x
+
+
+def _extract_stft(audios):
+    stfts = []
+    for ad in audios:
+        st = stft.spectrogram(ad, framelength=config.STFT_POINT,
+                              overlap=config.STFT_OVERLAP)
+        st = st.transpose()
+        stfts.append(st)
+    return stfts
+
+
+def test():
+    logging.info('test denoising model')
+    logging.info("read test signal according to %s, read noise from %s" %
+                 (config.DATA_TEST_LIST, config.DATA_TEST_STATIC_SIGNAL))
+    sig1_list = util.load_data(config.DATA_TEST_LIST, config.DATA_TEST_ROOT)
+    sig2 = util.read_wav(config.DATA_TEST_STATIC_SIGNAL)
+
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TEST_LIST,
+                                      config.DATA_TEST_STATIC_SIGNAL,
+                                      config.DATA_TEST_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list,
+                                              sig2_list, output=mix_filenames)
+
+    logging.info('extract stft features')
+    mix_stft = _extract_stft(mix_list)
+
+    mix_data = util.r_abs(mix_stft)
+    mix_data = [_extend(sig, config.EXTEND_NUM) for sig in mix_data]
+
+    logging.info('run neural network')
+    # 各层神经元数量
+    layer_size = [len(mix_data[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(mix_stft[0][0]) * 2)  # 输出层
+    dnn = nn.NNet(layer_size)
+    sig1_sig2 = dnn.run(mix_data, model_path=config.MODEL_NN_PATH)
+    # 神经网络输出为预测signal1与signal2的拼接，此处分离
+    sig1_stft, sig2_stft = _separate(sig1_sig2)
+
+    logging.info('Time-Frequency Masking')
+    mask = []
+    for s, n in zip(sig1_stft, sig2_stft):
+        mask.append(_build_ibm(s, n))
+    sig1_stft = [np.multiply(mix, m) for mix, m in zip(mix_stft, mask)]
+    sig2_stft = [np.subtract(mix, sig) for mix, sig in zip(mix_stft, sig1_stft)
+                 ]
+    logging.info('Inverse Short-Time Fourier Transformation')
+    # 从频域转换到时域
+    sep_sig1 = _istft(sig1_stft)
+    sep_sig2 = _istft(sig2_stft)
+
+    logging.info("write test audio into dir %s" % config.DATA_TEST_MIX_ROOT)
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    for ss, sn, f in zip(sep_sig1, sep_sig2, file_list):
+        sf.write(f + '.sep.sig1.wav', ss, config.SAMPLE_RATE)
+        sf.write(f + '.sep.sig2.wav', sn, config.SAMPLE_RATE)
+
+    logging.info('run bss evaluation')
+    sdr, sir, sar = _bss_eval()
+    logging.info('SDR: %g, SIR: %g, SAR: %g' % (sdr, sir, sar))
+
+
+def _build_ibm(sig1, sig2):
+    # 创建 ideal binary mask
+    # TODO deal with snr != 0
+    ibm = []
+    for s1, s2 in zip(sig1, sig2):
+        s1, s2 = np.abs(s1), np.abs(s2)
+        # bool object has no astype attribute
+        i = (s1 > s2).astype(np.float64)
+        ibm.append(i)
+    return ibm
+
+
+def _istft(stft_matrix_list):
+    '''
+    Inverse Short-Time Fourier Transformation
+    '''
+    audios = []
+    for sm in stft_matrix_list:
+        sm = np.transpose(sm)
+        ad = stft.ispectrogram(sm, framelength=config.STFT_POINT,
+                               overlap=config.STFT_OVERLAP)
+        audios.append(ad)
+    return audios
+
+
+def _bss_eval():
+    '''
+    通过调用Matlab BSS_EVAL工具进行表现评估
+    :return: sdr、sir、sar三个指标均值
+    '''
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    logging.info('connect to matlab')
+
+    avg_sdr, avg_sir, avg_sar = 0., 0., 0.
+    eng = matlab.engine.start_matlab()
+
+    for filepath in file_list:
+        sig1_wav = filepath + '.sig1.wav'
+        sig2_wav = filepath + '.sig2.wav'
+        sep_sig1_wav = filepath + '.sep.sig1.wav'
+        sep_sig2_wav = filepath + '.sep.sig2.wav'
+        mix_wav = filepath + '.mix.wav'
+        # matlab执行bss_eval.m
+        sdr, sir, sar = eng.bss_eval(sig1_wav, sig2_wav, sep_sig1_wav,
+                                     sep_sig2_wav, mix_wav, nargout=3)
+        avg_sdr += sdr / len(file_list)
+        avg_sir += sir / len(file_list)
+        avg_sar += sar / len(file_list)
+
+    return avg_sdr, avg_sir, avg_sar
+
+
+def _separate(X_list):
+    # 把 X_list 的每行均分成两半
+    a, b = [], []
+    for X in X_list:
+        a.append([row[:int(len(row) / 2)] for row in X])
+        b.append([row[int(len(row) / 2):] for row in X])
+
+    return a, b
+
+
+def _gen_mix_filename(sig1_list_csv, sig2_path, mix_dir):
+    '''
+    生成混合音频文件的路径str
+    :param sig1_list_csv: csv文件，第一列记录音频文件名
+    :param sig2_path: 另一个音源文件目录
+    :param mix_dir: 混合音频保存目录
+    :return:
+    '''
+    mix_file_list = []
+    signals_file_list = util.read_csv(sig1_list_csv)
+    sig2_fillename = os.path.basename(sig2_path).split('.')[0]
+    for sig1_file in signals_file_list:
+        sig1_filename = os.path.splitext(sig1_file[0])[0]
+        mix_file_list.append('%s/%s+%s' %
+                             (mix_dir, sig1_filename, sig2_fillename))
+    return mix_file_list
+
+
+def log_config():
+    with open(config.LOG_FILENAME, 'a', encoding='utf-8') as log:
+        log.write('config.py-----------------------------------------------\n')
+        with open('config.py', 'r', encoding='utf-8') as cf:
+            for line in cf:
+                log.write(line)
+        log.write('\n\n')
+        log.write('%s---------------------------------------------------\n'
+                  % config.RUN_SCRIPT)
+        with open(config.RUN_SCRIPT, 'r', encoding='utf-8') as scp:
+            for line in scp:
+                log.write(line)
+        log.write('\n\n')
+
+
+if __name__ == "__main__":
+    log_config()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TRAIN_ROOT)
+    util.create_more_signals(config.DATA_TRAIN_LOOP_SIGNAL,
+                             config.DATA_TRAIN_ROOT, config.DATA_TRAIN_LIST)
+    train()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TEST_ROOT)
+    util.create_more_signals(config.DATA_TEST_LOOP_SIGNAL,
+                             config.DATA_TEST_ROOT,
+                             config.DATA_TEST_LIST)
+    test()
+
+
+2017-03-17 10:17:31,580::INFO::create train loop signals
+2017-03-17 10:17:31,812::INFO::train bss model
+2017-03-17 10:17:32,238::INFO::mix signals
+2017-03-17 10:17:33,077::INFO::extract stft features
+config.py-----------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+运行参数配置，包括日志，数据文件，模型文件，模型参数等
+"""
+
+import logging
+import inspect
+import os
+
+################################
+# 日志配置
+_run_script = inspect.stack()[-1][1]
+# 运行脚本名
+RUN_SCRIPT = os.path.basename(_run_script)
+_run_script_no_ext = os.path.splitext(RUN_SCRIPT)[0]
+# 日志文件名
+LOG_FILENAME = '%s.log' % _run_script_no_ext
+
+# 配置日志输出文件及级别
+FORMAT = '%(asctime)s::%(levelname)s::%(message)s'
+logging.basicConfig(filename=LOG_FILENAME, level=logging.INFO, format=FORMAT,
+                    filemode='a')
+
+# 同时输出到控制台
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter(FORMAT))
+logging.getLogger('').addHandler(console)
+
+################################
+# 数据目录与文件路径
+# 数据根目录
+DATA_ROOT = './data'
+
+# 训练数据
+DATA_TRAIN_ROOT = DATA_ROOT + '/male_train'
+# csv文件，第一列为训练wav文件名
+DATA_TRAIN_LIST = DATA_TRAIN_ROOT + '/data.csv'
+# 混合后数据目录
+DATA_TRAIN_MIX_ROOT = DATA_ROOT + '/train.mix'
+
+# 测试数据，参考训练数据
+DATA_TEST_ROOT = DATA_ROOT + '/male_test'
+DATA_TEST_LIST = DATA_TEST_ROOT + '/data.csv'
+DATA_TEST_MIX_ROOT = DATA_ROOT + '/test.mix'
+
+# 用于循环得到更多的信号
+DATA_TRAIN_LOOP_SIGNAL = DATA_ROOT + '/male_train.wav'
+DATA_TEST_LOOP_SIGNAL = DATA_ROOT + '/male_test.wav'
+
+# 训练与测试信号
+DATA_TRAIN_STATIC_SIGNAL = DATA_ROOT + '/female_train.wav'
+DATA_TEST_STATIC_SIGNAL = DATA_ROOT + '/female_test.wav'
+
+################################
+# 模型存放目录与文件路径
+MODEL_ROOT = './model'
+# 神经网络模型
+MODEL_NN_PATH = MODEL_ROOT + '/neural_net.model'
+
+################################
+# 训练参数配置
+# wav采样率
+SAMPLE_RATE = 16000
+# STFT每帧点数
+STFT_POINT = 1024
+# STFT每帧重叠 1/DN_STFT_OVERLAP
+STFT_OVERLAP = 2
+# 神经网络隐藏层每层激活元数量
+LAYER_SIZE = [16]
+# 模型训练次数
+EPOCH = 100
+# 神经网络输入，每帧前/后扩展数
+EXTEND_NUM = 0
+# 神经网络学习速率
+LEARNING_RATE = 0.001
+# 是否正则化
+NORMALIZATION = True
+
+
+dnn4bss.py---------------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+基于神经网络的盲源分离模型
+
+参考：
+P.-S. Huang, M. Kim, M. Hasegawa-Johnson, P. Smaragdis, "Deep Learning for
+Monaural Speech Separation,"
+in IEEE International Conference on Acoustic,
+Speech and Signal Processing 2014.
+"""
+
+import matlab.engine
+import config
+import logging
+import util
+import os
+import numpy as np
+import nn
+import soundfile as sf
+import stft
+
+
+def train():
+    logging.info('train bss model')
+    sig1_list = util.load_data(config.DATA_TRAIN_LIST, config.DATA_TRAIN_ROOT)
+    sig2 = util.read_wav(config.DATA_TRAIN_STATIC_SIGNAL)
+
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TRAIN_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TRAIN_LIST,
+                                      config.DATA_TRAIN_STATIC_SIGNAL,
+                                      config.DATA_TRAIN_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list, sig2_list,
+                                              output=mix_filenames)
+
+    logging.info('extract stft features')
+    # sig1_stft = _extract_stft(sig1_list)
+    # sig2_stft = _extract_stft(sig2_list)
+    # mix_stft = _extract_stft(mix_list)
+    eng = matlab.engine.start_matlab()
+    sig1_list = matlab.double(sig1_list)
+    sig1_stft = eng.MRCG_features((sig1_list), 16000)
+    sig2_stf = eng.MRCG_features((sig2_list), 16000)
+    mix_stft = eng.MRCG_features((mix_list), 16000)
+    
+
+    logging.info('train neural network')
+    sig1_stft = util.r_abs(sig1_stft)
+    sig2_stft = util.r_abs(sig2_stft)
+    mix_stft = util.r_abs(mix_stft)
+    train_x, train_y = mix_stft, []
+    for s, n in zip(sig1_stft, sig2_stft):  # 将signal和noise拼接作为nn输出
+        train_y.append(np.concatenate((s, n), axis=1))
+    train_x = [_extend(sig, config.EXTEND_NUM) for sig in train_x]
+
+    # 各层神经元数量
+    layer_size = [len(train_x[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(train_y[0][0]))  # 输出层
+
+    dnn = nn.NNet(layer_size)
+    util.mkdir_p(config.MODEL_ROOT)
+    dnn.train(train_x, train_y, model_path=config.MODEL_NN_PATH,
+              training_epochs=config.EPOCH, learning_rate=config.LEARNING_RATE)
+    # dnn.test(train_x, train_y, model_path=config.MODEL_DN_NN_PATH)
+
+
+def _normalize(sig):
+    sig = np.array(sig)
+    return sig / np.sqrt(np.sum(sig ** 2))
+
+
+def _extend(sig, increment):
+    '''
+    将每帧与前后帧连结
+    :param sig: 信号
+    :param increment: 前/后连结帧数量
+    :return:
+    '''
+    recurrent_train_x = []
+    for i in range(len(sig)):  # 帧数
+        temp = []
+        for k in range(i - increment, i + increment + 1):
+            if k < 0 or k >= len(sig):
+                temp.extend(np.zeros(len(sig[i])))
+            else:
+                temp.extend(sig[k])
+        temp_2 = np.array(temp)
+        recurrent_train_x.append(temp_2)
+    return recurrent_train_x
+
+
+def _extract_stft(audios):
+    stfts = []
+    for ad in audios:
+        st = stft.spectrogram(ad, framelength=config.STFT_POINT,
+                              overlap=config.STFT_OVERLAP)
+        st = st.transpose()
+        stfts.append(st)
+    return stfts
+
+
+def test():
+    logging.info('test denoising model')
+    logging.info("read test signal according to %s, read noise from %s" %
+                 (config.DATA_TEST_LIST, config.DATA_TEST_STATIC_SIGNAL))
+    sig1_list = util.load_data(config.DATA_TEST_LIST, config.DATA_TEST_ROOT)
+    sig2 = util.read_wav(config.DATA_TEST_STATIC_SIGNAL)
+
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TEST_LIST,
+                                      config.DATA_TEST_STATIC_SIGNAL,
+                                      config.DATA_TEST_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list,
+                                              sig2_list, output=mix_filenames)
+
+    logging.info('extract stft features')
+    mix_stft = _extract_stft(mix_list)
+
+    mix_data = util.r_abs(mix_stft)
+    mix_data = [_extend(sig, config.EXTEND_NUM) for sig in mix_data]
+
+    logging.info('run neural network')
+    # 各层神经元数量
+    layer_size = [len(mix_data[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(mix_stft[0][0]) * 2)  # 输出层
+    dnn = nn.NNet(layer_size)
+    sig1_sig2 = dnn.run(mix_data, model_path=config.MODEL_NN_PATH)
+    # 神经网络输出为预测signal1与signal2的拼接，此处分离
+    sig1_stft, sig2_stft = _separate(sig1_sig2)
+
+    logging.info('Time-Frequency Masking')
+    mask = []
+    for s, n in zip(sig1_stft, sig2_stft):
+        mask.append(_build_ibm(s, n))
+    sig1_stft = [np.multiply(mix, m) for mix, m in zip(mix_stft, mask)]
+    sig2_stft = [np.subtract(mix, sig) for mix, sig in zip(mix_stft, sig1_stft)
+                 ]
+    logging.info('Inverse Short-Time Fourier Transformation')
+    # 从频域转换到时域
+    sep_sig1 = _istft(sig1_stft)
+    sep_sig2 = _istft(sig2_stft)
+
+    logging.info("write test audio into dir %s" % config.DATA_TEST_MIX_ROOT)
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    for ss, sn, f in zip(sep_sig1, sep_sig2, file_list):
+        sf.write(f + '.sep.sig1.wav', ss, config.SAMPLE_RATE)
+        sf.write(f + '.sep.sig2.wav', sn, config.SAMPLE_RATE)
+
+    logging.info('run bss evaluation')
+    sdr, sir, sar = _bss_eval()
+    logging.info('SDR: %g, SIR: %g, SAR: %g' % (sdr, sir, sar))
+
+
+def _build_ibm(sig1, sig2):
+    # 创建 ideal binary mask
+    # TODO deal with snr != 0
+    ibm = []
+    for s1, s2 in zip(sig1, sig2):
+        s1, s2 = np.abs(s1), np.abs(s2)
+        # bool object has no astype attribute
+        i = (s1 > s2).astype(np.float64)
+        ibm.append(i)
+    return ibm
+
+
+def _istft(stft_matrix_list):
+    '''
+    Inverse Short-Time Fourier Transformation
+    '''
+    audios = []
+    for sm in stft_matrix_list:
+        sm = np.transpose(sm)
+        ad = stft.ispectrogram(sm, framelength=config.STFT_POINT,
+                               overlap=config.STFT_OVERLAP)
+        audios.append(ad)
+    return audios
+
+
+def _bss_eval():
+    '''
+    通过调用Matlab BSS_EVAL工具进行表现评估
+    :return: sdr、sir、sar三个指标均值
+    '''
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    logging.info('connect to matlab')
+
+    avg_sdr, avg_sir, avg_sar = 0., 0., 0.
+    eng = matlab.engine.start_matlab()
+
+    for filepath in file_list:
+        sig1_wav = filepath + '.sig1.wav'
+        sig2_wav = filepath + '.sig2.wav'
+        sep_sig1_wav = filepath + '.sep.sig1.wav'
+        sep_sig2_wav = filepath + '.sep.sig2.wav'
+        mix_wav = filepath + '.mix.wav'
+        # matlab执行bss_eval.m
+        sdr, sir, sar = eng.bss_eval(sig1_wav, sig2_wav, sep_sig1_wav,
+                                     sep_sig2_wav, mix_wav, nargout=3)
+        avg_sdr += sdr / len(file_list)
+        avg_sir += sir / len(file_list)
+        avg_sar += sar / len(file_list)
+
+    return avg_sdr, avg_sir, avg_sar
+
+
+def _separate(X_list):
+    # 把 X_list 的每行均分成两半
+    a, b = [], []
+    for X in X_list:
+        a.append([row[:int(len(row) / 2)] for row in X])
+        b.append([row[int(len(row) / 2):] for row in X])
+
+    return a, b
+
+
+def _gen_mix_filename(sig1_list_csv, sig2_path, mix_dir):
+    '''
+    生成混合音频文件的路径str
+    :param sig1_list_csv: csv文件，第一列记录音频文件名
+    :param sig2_path: 另一个音源文件目录
+    :param mix_dir: 混合音频保存目录
+    :return:
+    '''
+    mix_file_list = []
+    signals_file_list = util.read_csv(sig1_list_csv)
+    sig2_fillename = os.path.basename(sig2_path).split('.')[0]
+    for sig1_file in signals_file_list:
+        sig1_filename = os.path.splitext(sig1_file[0])[0]
+        mix_file_list.append('%s/%s+%s' %
+                             (mix_dir, sig1_filename, sig2_fillename))
+    return mix_file_list
+
+
+def log_config():
+    with open(config.LOG_FILENAME, 'a', encoding='utf-8') as log:
+        log.write('config.py-----------------------------------------------\n')
+        with open('config.py', 'r', encoding='utf-8') as cf:
+            for line in cf:
+                log.write(line)
+        log.write('\n\n')
+        log.write('%s---------------------------------------------------\n'
+                  % config.RUN_SCRIPT)
+        with open(config.RUN_SCRIPT, 'r', encoding='utf-8') as scp:
+            for line in scp:
+                log.write(line)
+        log.write('\n\n')
+
+
+if __name__ == "__main__":
+    log_config()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TRAIN_ROOT)
+    util.create_more_signals(config.DATA_TRAIN_LOOP_SIGNAL,
+                             config.DATA_TRAIN_ROOT, config.DATA_TRAIN_LIST)
+    train()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TEST_ROOT)
+    util.create_more_signals(config.DATA_TEST_LOOP_SIGNAL,
+                             config.DATA_TEST_ROOT,
+                             config.DATA_TEST_LIST)
+    test()
+
+
+2017-03-17 10:18:46,911::INFO::create train loop signals
+2017-03-17 10:18:47,113::INFO::train bss model
+2017-03-17 10:18:47,406::INFO::mix signals
+2017-03-17 10:18:48,138::INFO::extract stft features
+config.py-----------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+运行参数配置，包括日志，数据文件，模型文件，模型参数等
+"""
+
+import logging
+import inspect
+import os
+
+################################
+# 日志配置
+_run_script = inspect.stack()[-1][1]
+# 运行脚本名
+RUN_SCRIPT = os.path.basename(_run_script)
+_run_script_no_ext = os.path.splitext(RUN_SCRIPT)[0]
+# 日志文件名
+LOG_FILENAME = '%s.log' % _run_script_no_ext
+
+# 配置日志输出文件及级别
+FORMAT = '%(asctime)s::%(levelname)s::%(message)s'
+logging.basicConfig(filename=LOG_FILENAME, level=logging.INFO, format=FORMAT,
+                    filemode='a')
+
+# 同时输出到控制台
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter(FORMAT))
+logging.getLogger('').addHandler(console)
+
+################################
+# 数据目录与文件路径
+# 数据根目录
+DATA_ROOT = './data'
+
+# 训练数据
+DATA_TRAIN_ROOT = DATA_ROOT + '/male_train'
+# csv文件，第一列为训练wav文件名
+DATA_TRAIN_LIST = DATA_TRAIN_ROOT + '/data.csv'
+# 混合后数据目录
+DATA_TRAIN_MIX_ROOT = DATA_ROOT + '/train.mix'
+
+# 测试数据，参考训练数据
+DATA_TEST_ROOT = DATA_ROOT + '/male_test'
+DATA_TEST_LIST = DATA_TEST_ROOT + '/data.csv'
+DATA_TEST_MIX_ROOT = DATA_ROOT + '/test.mix'
+
+# 用于循环得到更多的信号
+DATA_TRAIN_LOOP_SIGNAL = DATA_ROOT + '/male_train.wav'
+DATA_TEST_LOOP_SIGNAL = DATA_ROOT + '/male_test.wav'
+
+# 训练与测试信号
+DATA_TRAIN_STATIC_SIGNAL = DATA_ROOT + '/female_train.wav'
+DATA_TEST_STATIC_SIGNAL = DATA_ROOT + '/female_test.wav'
+
+################################
+# 模型存放目录与文件路径
+MODEL_ROOT = './model'
+# 神经网络模型
+MODEL_NN_PATH = MODEL_ROOT + '/neural_net.model'
+
+################################
+# 训练参数配置
+# wav采样率
+SAMPLE_RATE = 16000
+# STFT每帧点数
+STFT_POINT = 1024
+# STFT每帧重叠 1/DN_STFT_OVERLAP
+STFT_OVERLAP = 2
+# 神经网络隐藏层每层激活元数量
+LAYER_SIZE = [16]
+# 模型训练次数
+EPOCH = 100
+# 神经网络输入，每帧前/后扩展数
+EXTEND_NUM = 0
+# 神经网络学习速率
+LEARNING_RATE = 0.001
+# 是否正则化
+NORMALIZATION = True
+
+
+dnn4bss.py---------------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+基于神经网络的盲源分离模型
+
+参考：
+P.-S. Huang, M. Kim, M. Hasegawa-Johnson, P. Smaragdis, "Deep Learning for
+Monaural Speech Separation,"
+in IEEE International Conference on Acoustic,
+Speech and Signal Processing 2014.
+"""
+
+import matlab.engine
+import config
+import logging
+import util
+import os
+import numpy as np
+import nn
+import soundfile as sf
+import stft
+
+
+def train():
+    logging.info('train bss model')
+    sig1_list = util.load_data(config.DATA_TRAIN_LIST, config.DATA_TRAIN_ROOT)
+    sig2 = util.read_wav(config.DATA_TRAIN_STATIC_SIGNAL)
+
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TRAIN_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TRAIN_LIST,
+                                      config.DATA_TRAIN_STATIC_SIGNAL,
+                                      config.DATA_TRAIN_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list, sig2_list,
+                                              output=mix_filenames)
+
+    logging.info('extract stft features')
+    # sig1_stft = _extract_stft(sig1_list)
+    # sig2_stft = _extract_stft(sig2_list)
+    # mix_stft = _extract_stft(mix_list)
+    eng = matlab.engine.start_matlab()
+    print('sig1_list is', sig1_list)
+    sig1_list = matlab.double(list(sig1_list))
+    sig1_stft = eng.MRCG_features(sig1_list, 16000)
+    sig2_stf = eng.MRCG_features((sig2_list), 16000)
+    mix_stft = eng.MRCG_features((mix_list), 16000)
+    
+
+    logging.info('train neural network')
+    sig1_stft = util.r_abs(sig1_stft)
+    sig2_stft = util.r_abs(sig2_stft)
+    mix_stft = util.r_abs(mix_stft)
+    train_x, train_y = mix_stft, []
+    for s, n in zip(sig1_stft, sig2_stft):  # 将signal和noise拼接作为nn输出
+        train_y.append(np.concatenate((s, n), axis=1))
+    train_x = [_extend(sig, config.EXTEND_NUM) for sig in train_x]
+
+    # 各层神经元数量
+    layer_size = [len(train_x[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(train_y[0][0]))  # 输出层
+
+    dnn = nn.NNet(layer_size)
+    util.mkdir_p(config.MODEL_ROOT)
+    dnn.train(train_x, train_y, model_path=config.MODEL_NN_PATH,
+              training_epochs=config.EPOCH, learning_rate=config.LEARNING_RATE)
+    # dnn.test(train_x, train_y, model_path=config.MODEL_DN_NN_PATH)
+
+
+def _normalize(sig):
+    sig = np.array(sig)
+    return sig / np.sqrt(np.sum(sig ** 2))
+
+
+def _extend(sig, increment):
+    '''
+    将每帧与前后帧连结
+    :param sig: 信号
+    :param increment: 前/后连结帧数量
+    :return:
+    '''
+    recurrent_train_x = []
+    for i in range(len(sig)):  # 帧数
+        temp = []
+        for k in range(i - increment, i + increment + 1):
+            if k < 0 or k >= len(sig):
+                temp.extend(np.zeros(len(sig[i])))
+            else:
+                temp.extend(sig[k])
+        temp_2 = np.array(temp)
+        recurrent_train_x.append(temp_2)
+    return recurrent_train_x
+
+
+def _extract_stft(audios):
+    stfts = []
+    for ad in audios:
+        st = stft.spectrogram(ad, framelength=config.STFT_POINT,
+                              overlap=config.STFT_OVERLAP)
+        st = st.transpose()
+        stfts.append(st)
+    return stfts
+
+
+def test():
+    logging.info('test denoising model')
+    logging.info("read test signal according to %s, read noise from %s" %
+                 (config.DATA_TEST_LIST, config.DATA_TEST_STATIC_SIGNAL))
+    sig1_list = util.load_data(config.DATA_TEST_LIST, config.DATA_TEST_ROOT)
+    sig2 = util.read_wav(config.DATA_TEST_STATIC_SIGNAL)
+
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TEST_LIST,
+                                      config.DATA_TEST_STATIC_SIGNAL,
+                                      config.DATA_TEST_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list,
+                                              sig2_list, output=mix_filenames)
+
+    logging.info('extract stft features')
+    mix_stft = _extract_stft(mix_list)
+
+    mix_data = util.r_abs(mix_stft)
+    mix_data = [_extend(sig, config.EXTEND_NUM) for sig in mix_data]
+
+    logging.info('run neural network')
+    # 各层神经元数量
+    layer_size = [len(mix_data[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(mix_stft[0][0]) * 2)  # 输出层
+    dnn = nn.NNet(layer_size)
+    sig1_sig2 = dnn.run(mix_data, model_path=config.MODEL_NN_PATH)
+    # 神经网络输出为预测signal1与signal2的拼接，此处分离
+    sig1_stft, sig2_stft = _separate(sig1_sig2)
+
+    logging.info('Time-Frequency Masking')
+    mask = []
+    for s, n in zip(sig1_stft, sig2_stft):
+        mask.append(_build_ibm(s, n))
+    sig1_stft = [np.multiply(mix, m) for mix, m in zip(mix_stft, mask)]
+    sig2_stft = [np.subtract(mix, sig) for mix, sig in zip(mix_stft, sig1_stft)
+                 ]
+    logging.info('Inverse Short-Time Fourier Transformation')
+    # 从频域转换到时域
+    sep_sig1 = _istft(sig1_stft)
+    sep_sig2 = _istft(sig2_stft)
+
+    logging.info("write test audio into dir %s" % config.DATA_TEST_MIX_ROOT)
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    for ss, sn, f in zip(sep_sig1, sep_sig2, file_list):
+        sf.write(f + '.sep.sig1.wav', ss, config.SAMPLE_RATE)
+        sf.write(f + '.sep.sig2.wav', sn, config.SAMPLE_RATE)
+
+    logging.info('run bss evaluation')
+    sdr, sir, sar = _bss_eval()
+    logging.info('SDR: %g, SIR: %g, SAR: %g' % (sdr, sir, sar))
+
+
+def _build_ibm(sig1, sig2):
+    # 创建 ideal binary mask
+    # TODO deal with snr != 0
+    ibm = []
+    for s1, s2 in zip(sig1, sig2):
+        s1, s2 = np.abs(s1), np.abs(s2)
+        # bool object has no astype attribute
+        i = (s1 > s2).astype(np.float64)
+        ibm.append(i)
+    return ibm
+
+
+def _istft(stft_matrix_list):
+    '''
+    Inverse Short-Time Fourier Transformation
+    '''
+    audios = []
+    for sm in stft_matrix_list:
+        sm = np.transpose(sm)
+        ad = stft.ispectrogram(sm, framelength=config.STFT_POINT,
+                               overlap=config.STFT_OVERLAP)
+        audios.append(ad)
+    return audios
+
+
+def _bss_eval():
+    '''
+    通过调用Matlab BSS_EVAL工具进行表现评估
+    :return: sdr、sir、sar三个指标均值
+    '''
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    logging.info('connect to matlab')
+
+    avg_sdr, avg_sir, avg_sar = 0., 0., 0.
+    eng = matlab.engine.start_matlab()
+
+    for filepath in file_list:
+        sig1_wav = filepath + '.sig1.wav'
+        sig2_wav = filepath + '.sig2.wav'
+        sep_sig1_wav = filepath + '.sep.sig1.wav'
+        sep_sig2_wav = filepath + '.sep.sig2.wav'
+        mix_wav = filepath + '.mix.wav'
+        # matlab执行bss_eval.m
+        sdr, sir, sar = eng.bss_eval(sig1_wav, sig2_wav, sep_sig1_wav,
+                                     sep_sig2_wav, mix_wav, nargout=3)
+        avg_sdr += sdr / len(file_list)
+        avg_sir += sir / len(file_list)
+        avg_sar += sar / len(file_list)
+
+    return avg_sdr, avg_sir, avg_sar
+
+
+def _separate(X_list):
+    # 把 X_list 的每行均分成两半
+    a, b = [], []
+    for X in X_list:
+        a.append([row[:int(len(row) / 2)] for row in X])
+        b.append([row[int(len(row) / 2):] for row in X])
+
+    return a, b
+
+
+def _gen_mix_filename(sig1_list_csv, sig2_path, mix_dir):
+    '''
+    生成混合音频文件的路径str
+    :param sig1_list_csv: csv文件，第一列记录音频文件名
+    :param sig2_path: 另一个音源文件目录
+    :param mix_dir: 混合音频保存目录
+    :return:
+    '''
+    mix_file_list = []
+    signals_file_list = util.read_csv(sig1_list_csv)
+    sig2_fillename = os.path.basename(sig2_path).split('.')[0]
+    for sig1_file in signals_file_list:
+        sig1_filename = os.path.splitext(sig1_file[0])[0]
+        mix_file_list.append('%s/%s+%s' %
+                             (mix_dir, sig1_filename, sig2_fillename))
+    return mix_file_list
+
+
+def log_config():
+    with open(config.LOG_FILENAME, 'a', encoding='utf-8') as log:
+        log.write('config.py-----------------------------------------------\n')
+        with open('config.py', 'r', encoding='utf-8') as cf:
+            for line in cf:
+                log.write(line)
+        log.write('\n\n')
+        log.write('%s---------------------------------------------------\n'
+                  % config.RUN_SCRIPT)
+        with open(config.RUN_SCRIPT, 'r', encoding='utf-8') as scp:
+            for line in scp:
+                log.write(line)
+        log.write('\n\n')
+
+
+if __name__ == "__main__":
+    log_config()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TRAIN_ROOT)
+    util.create_more_signals(config.DATA_TRAIN_LOOP_SIGNAL,
+                             config.DATA_TRAIN_ROOT, config.DATA_TRAIN_LIST)
+    train()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TEST_ROOT)
+    util.create_more_signals(config.DATA_TEST_LOOP_SIGNAL,
+                             config.DATA_TEST_ROOT,
+                             config.DATA_TEST_LIST)
+    test()
+
+
+2017-03-17 10:22:55,018::INFO::create train loop signals
+2017-03-17 10:22:55,228::INFO::train bss model
+2017-03-17 10:22:55,668::INFO::mix signals
+2017-03-17 10:22:56,480::INFO::extract stft features
+config.py-----------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+运行参数配置，包括日志，数据文件，模型文件，模型参数等
+"""
+
+import logging
+import inspect
+import os
+
+################################
+# 日志配置
+_run_script = inspect.stack()[-1][1]
+# 运行脚本名
+RUN_SCRIPT = os.path.basename(_run_script)
+_run_script_no_ext = os.path.splitext(RUN_SCRIPT)[0]
+# 日志文件名
+LOG_FILENAME = '%s.log' % _run_script_no_ext
+
+# 配置日志输出文件及级别
+FORMAT = '%(asctime)s::%(levelname)s::%(message)s'
+logging.basicConfig(filename=LOG_FILENAME, level=logging.INFO, format=FORMAT,
+                    filemode='a')
+
+# 同时输出到控制台
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter(FORMAT))
+logging.getLogger('').addHandler(console)
+
+################################
+# 数据目录与文件路径
+# 数据根目录
+DATA_ROOT = './data'
+
+# 训练数据
+DATA_TRAIN_ROOT = DATA_ROOT + '/male_train'
+# csv文件，第一列为训练wav文件名
+DATA_TRAIN_LIST = DATA_TRAIN_ROOT + '/data.csv'
+# 混合后数据目录
+DATA_TRAIN_MIX_ROOT = DATA_ROOT + '/train.mix'
+
+# 测试数据，参考训练数据
+DATA_TEST_ROOT = DATA_ROOT + '/male_test'
+DATA_TEST_LIST = DATA_TEST_ROOT + '/data.csv'
+DATA_TEST_MIX_ROOT = DATA_ROOT + '/test.mix'
+
+# 用于循环得到更多的信号
+DATA_TRAIN_LOOP_SIGNAL = DATA_ROOT + '/male_train.wav'
+DATA_TEST_LOOP_SIGNAL = DATA_ROOT + '/male_test.wav'
+
+# 训练与测试信号
+DATA_TRAIN_STATIC_SIGNAL = DATA_ROOT + '/female_train.wav'
+DATA_TEST_STATIC_SIGNAL = DATA_ROOT + '/female_test.wav'
+
+################################
+# 模型存放目录与文件路径
+MODEL_ROOT = './model'
+# 神经网络模型
+MODEL_NN_PATH = MODEL_ROOT + '/neural_net.model'
+
+################################
+# 训练参数配置
+# wav采样率
+SAMPLE_RATE = 16000
+# STFT每帧点数
+STFT_POINT = 1024
+# STFT每帧重叠 1/DN_STFT_OVERLAP
+STFT_OVERLAP = 2
+# 神经网络隐藏层每层激活元数量
+LAYER_SIZE = [16]
+# 模型训练次数
+EPOCH = 100
+# 神经网络输入，每帧前/后扩展数
+EXTEND_NUM = 0
+# 神经网络学习速率
+LEARNING_RATE = 0.001
+# 是否正则化
+NORMALIZATION = True
+
+
+dnn4bss.py---------------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+基于神经网络的盲源分离模型
+
+参考：
+P.-S. Huang, M. Kim, M. Hasegawa-Johnson, P. Smaragdis, "Deep Learning for
+Monaural Speech Separation,"
+in IEEE International Conference on Acoustic,
+Speech and Signal Processing 2014.
+"""
+
+import matlab.engine
+import config
+import logging
+import util
+import os
+import numpy as np
+import nn
+import soundfile as sf
+import stft
+
+
+def train():
+    logging.info('train bss model')
+    sig1_list = util.load_data(config.DATA_TRAIN_LIST, config.DATA_TRAIN_ROOT)
+    sig2 = util.read_wav(config.DATA_TRAIN_STATIC_SIGNAL)
+    print('sig1_list is', sig1_list)
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TRAIN_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TRAIN_LIST,
+                                      config.DATA_TRAIN_STATIC_SIGNAL,
+                                      config.DATA_TRAIN_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list, sig2_list,
+                                              output=mix_filenames)
+
+    logging.info('extract stft features')
+    # sig1_stft = _extract_stft(sig1_list)
+    # sig2_stft = _extract_stft(sig2_list)
+    # mix_stft = _extract_stft(mix_list)
+    eng = matlab.engine.start_matlab()
+    print('sig1_list is', sig1_list)
+    sig1_list = matlab.double(list(sig1_list))
+    sig1_stft = eng.MRCG_features(sig1_list, 16000)
+    sig2_stf = eng.MRCG_features((sig2_list), 16000)
+    mix_stft = eng.MRCG_features((mix_list), 16000)
+    
+
+    logging.info('train neural network')
+    sig1_stft = util.r_abs(sig1_stft)
+    sig2_stft = util.r_abs(sig2_stft)
+    mix_stft = util.r_abs(mix_stft)
+    train_x, train_y = mix_stft, []
+    for s, n in zip(sig1_stft, sig2_stft):  # 将signal和noise拼接作为nn输出
+        train_y.append(np.concatenate((s, n), axis=1))
+    train_x = [_extend(sig, config.EXTEND_NUM) for sig in train_x]
+
+    # 各层神经元数量
+    layer_size = [len(train_x[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(train_y[0][0]))  # 输出层
+
+    dnn = nn.NNet(layer_size)
+    util.mkdir_p(config.MODEL_ROOT)
+    dnn.train(train_x, train_y, model_path=config.MODEL_NN_PATH,
+              training_epochs=config.EPOCH, learning_rate=config.LEARNING_RATE)
+    # dnn.test(train_x, train_y, model_path=config.MODEL_DN_NN_PATH)
+
+
+def _normalize(sig):
+    sig = np.array(sig)
+    return sig / np.sqrt(np.sum(sig ** 2))
+
+
+def _extend(sig, increment):
+    '''
+    将每帧与前后帧连结
+    :param sig: 信号
+    :param increment: 前/后连结帧数量
+    :return:
+    '''
+    recurrent_train_x = []
+    for i in range(len(sig)):  # 帧数
+        temp = []
+        for k in range(i - increment, i + increment + 1):
+            if k < 0 or k >= len(sig):
+                temp.extend(np.zeros(len(sig[i])))
+            else:
+                temp.extend(sig[k])
+        temp_2 = np.array(temp)
+        recurrent_train_x.append(temp_2)
+    return recurrent_train_x
+
+
+def _extract_stft(audios):
+    stfts = []
+    for ad in audios:
+        st = stft.spectrogram(ad, framelength=config.STFT_POINT,
+                              overlap=config.STFT_OVERLAP)
+        st = st.transpose()
+        stfts.append(st)
+    return stfts
+
+
+def test():
+    logging.info('test denoising model')
+    logging.info("read test signal according to %s, read noise from %s" %
+                 (config.DATA_TEST_LIST, config.DATA_TEST_STATIC_SIGNAL))
+    sig1_list = util.load_data(config.DATA_TEST_LIST, config.DATA_TEST_ROOT)
+    sig2 = util.read_wav(config.DATA_TEST_STATIC_SIGNAL)
+
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TEST_LIST,
+                                      config.DATA_TEST_STATIC_SIGNAL,
+                                      config.DATA_TEST_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list,
+                                              sig2_list, output=mix_filenames)
+
+    logging.info('extract stft features')
+    mix_stft = _extract_stft(mix_list)
+
+    mix_data = util.r_abs(mix_stft)
+    mix_data = [_extend(sig, config.EXTEND_NUM) for sig in mix_data]
+
+    logging.info('run neural network')
+    # 各层神经元数量
+    layer_size = [len(mix_data[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(mix_stft[0][0]) * 2)  # 输出层
+    dnn = nn.NNet(layer_size)
+    sig1_sig2 = dnn.run(mix_data, model_path=config.MODEL_NN_PATH)
+    # 神经网络输出为预测signal1与signal2的拼接，此处分离
+    sig1_stft, sig2_stft = _separate(sig1_sig2)
+
+    logging.info('Time-Frequency Masking')
+    mask = []
+    for s, n in zip(sig1_stft, sig2_stft):
+        mask.append(_build_ibm(s, n))
+    sig1_stft = [np.multiply(mix, m) for mix, m in zip(mix_stft, mask)]
+    sig2_stft = [np.subtract(mix, sig) for mix, sig in zip(mix_stft, sig1_stft)
+                 ]
+    logging.info('Inverse Short-Time Fourier Transformation')
+    # 从频域转换到时域
+    sep_sig1 = _istft(sig1_stft)
+    sep_sig2 = _istft(sig2_stft)
+
+    logging.info("write test audio into dir %s" % config.DATA_TEST_MIX_ROOT)
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    for ss, sn, f in zip(sep_sig1, sep_sig2, file_list):
+        sf.write(f + '.sep.sig1.wav', ss, config.SAMPLE_RATE)
+        sf.write(f + '.sep.sig2.wav', sn, config.SAMPLE_RATE)
+
+    logging.info('run bss evaluation')
+    sdr, sir, sar = _bss_eval()
+    logging.info('SDR: %g, SIR: %g, SAR: %g' % (sdr, sir, sar))
+
+
+def _build_ibm(sig1, sig2):
+    # 创建 ideal binary mask
+    # TODO deal with snr != 0
+    ibm = []
+    for s1, s2 in zip(sig1, sig2):
+        s1, s2 = np.abs(s1), np.abs(s2)
+        # bool object has no astype attribute
+        i = (s1 > s2).astype(np.float64)
+        ibm.append(i)
+    return ibm
+
+
+def _istft(stft_matrix_list):
+    '''
+    Inverse Short-Time Fourier Transformation
+    '''
+    audios = []
+    for sm in stft_matrix_list:
+        sm = np.transpose(sm)
+        ad = stft.ispectrogram(sm, framelength=config.STFT_POINT,
+                               overlap=config.STFT_OVERLAP)
+        audios.append(ad)
+    return audios
+
+
+def _bss_eval():
+    '''
+    通过调用Matlab BSS_EVAL工具进行表现评估
+    :return: sdr、sir、sar三个指标均值
+    '''
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    logging.info('connect to matlab')
+
+    avg_sdr, avg_sir, avg_sar = 0., 0., 0.
+    eng = matlab.engine.start_matlab()
+
+    for filepath in file_list:
+        sig1_wav = filepath + '.sig1.wav'
+        sig2_wav = filepath + '.sig2.wav'
+        sep_sig1_wav = filepath + '.sep.sig1.wav'
+        sep_sig2_wav = filepath + '.sep.sig2.wav'
+        mix_wav = filepath + '.mix.wav'
+        # matlab执行bss_eval.m
+        sdr, sir, sar = eng.bss_eval(sig1_wav, sig2_wav, sep_sig1_wav,
+                                     sep_sig2_wav, mix_wav, nargout=3)
+        avg_sdr += sdr / len(file_list)
+        avg_sir += sir / len(file_list)
+        avg_sar += sar / len(file_list)
+
+    return avg_sdr, avg_sir, avg_sar
+
+
+def _separate(X_list):
+    # 把 X_list 的每行均分成两半
+    a, b = [], []
+    for X in X_list:
+        a.append([row[:int(len(row) / 2)] for row in X])
+        b.append([row[int(len(row) / 2):] for row in X])
+
+    return a, b
+
+
+def _gen_mix_filename(sig1_list_csv, sig2_path, mix_dir):
+    '''
+    生成混合音频文件的路径str
+    :param sig1_list_csv: csv文件，第一列记录音频文件名
+    :param sig2_path: 另一个音源文件目录
+    :param mix_dir: 混合音频保存目录
+    :return:
+    '''
+    mix_file_list = []
+    signals_file_list = util.read_csv(sig1_list_csv)
+    sig2_fillename = os.path.basename(sig2_path).split('.')[0]
+    for sig1_file in signals_file_list:
+        sig1_filename = os.path.splitext(sig1_file[0])[0]
+        mix_file_list.append('%s/%s+%s' %
+                             (mix_dir, sig1_filename, sig2_fillename))
+    return mix_file_list
+
+
+def log_config():
+    with open(config.LOG_FILENAME, 'a', encoding='utf-8') as log:
+        log.write('config.py-----------------------------------------------\n')
+        with open('config.py', 'r', encoding='utf-8') as cf:
+            for line in cf:
+                log.write(line)
+        log.write('\n\n')
+        log.write('%s---------------------------------------------------\n'
+                  % config.RUN_SCRIPT)
+        with open(config.RUN_SCRIPT, 'r', encoding='utf-8') as scp:
+            for line in scp:
+                log.write(line)
+        log.write('\n\n')
+
+
+if __name__ == "__main__":
+    log_config()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TRAIN_ROOT)
+    util.create_more_signals(config.DATA_TRAIN_LOOP_SIGNAL,
+                             config.DATA_TRAIN_ROOT, config.DATA_TRAIN_LIST)
+    train()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TEST_ROOT)
+    util.create_more_signals(config.DATA_TEST_LOOP_SIGNAL,
+                             config.DATA_TEST_ROOT,
+                             config.DATA_TEST_LIST)
+    test()
+
+
+2017-03-17 10:32:18,850::INFO::create train loop signals
+2017-03-17 10:32:19,051::INFO::train bss model
+2017-03-17 10:32:19,361::INFO::mix signals
+2017-03-17 10:32:20,163::INFO::extract stft features
+config.py-----------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+运行参数配置，包括日志，数据文件，模型文件，模型参数等
+"""
+
+import logging
+import inspect
+import os
+
+################################
+# 日志配置
+_run_script = inspect.stack()[-1][1]
+# 运行脚本名
+RUN_SCRIPT = os.path.basename(_run_script)
+_run_script_no_ext = os.path.splitext(RUN_SCRIPT)[0]
+# 日志文件名
+LOG_FILENAME = '%s.log' % _run_script_no_ext
+
+# 配置日志输出文件及级别
+FORMAT = '%(asctime)s::%(levelname)s::%(message)s'
+logging.basicConfig(filename=LOG_FILENAME, level=logging.INFO, format=FORMAT,
+                    filemode='a')
+
+# 同时输出到控制台
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter(FORMAT))
+logging.getLogger('').addHandler(console)
+
+################################
+# 数据目录与文件路径
+# 数据根目录
+DATA_ROOT = './data'
+
+# 训练数据
+DATA_TRAIN_ROOT = DATA_ROOT + '/male_train'
+# csv文件，第一列为训练wav文件名
+DATA_TRAIN_LIST = DATA_TRAIN_ROOT + '/data.csv'
+# 混合后数据目录
+DATA_TRAIN_MIX_ROOT = DATA_ROOT + '/train.mix'
+
+# 测试数据，参考训练数据
+DATA_TEST_ROOT = DATA_ROOT + '/male_test'
+DATA_TEST_LIST = DATA_TEST_ROOT + '/data.csv'
+DATA_TEST_MIX_ROOT = DATA_ROOT + '/test.mix'
+
+# 用于循环得到更多的信号
+DATA_TRAIN_LOOP_SIGNAL = DATA_ROOT + '/male_train.wav'
+DATA_TEST_LOOP_SIGNAL = DATA_ROOT + '/male_test.wav'
+
+# 训练与测试信号
+DATA_TRAIN_STATIC_SIGNAL = DATA_ROOT + '/female_train.wav'
+DATA_TEST_STATIC_SIGNAL = DATA_ROOT + '/female_test.wav'
+
+################################
+# 模型存放目录与文件路径
+MODEL_ROOT = './model'
+# 神经网络模型
+MODEL_NN_PATH = MODEL_ROOT + '/neural_net.model'
+
+################################
+# 训练参数配置
+# wav采样率
+SAMPLE_RATE = 16000
+# STFT每帧点数
+STFT_POINT = 1024
+# STFT每帧重叠 1/DN_STFT_OVERLAP
+STFT_OVERLAP = 2
+# 神经网络隐藏层每层激活元数量
+LAYER_SIZE = [16]
+# 模型训练次数
+EPOCH = 100
+# 神经网络输入，每帧前/后扩展数
+EXTEND_NUM = 0
+# 神经网络学习速率
+LEARNING_RATE = 0.001
+# 是否正则化
+NORMALIZATION = True
+
+
+dnn4bss.py---------------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+基于神经网络的盲源分离模型
+
+参考：
+P.-S. Huang, M. Kim, M. Hasegawa-Johnson, P. Smaragdis, "Deep Learning for
+Monaural Speech Separation,"
+in IEEE International Conference on Acoustic,
+Speech and Signal Processing 2014.
+"""
+
+import matlab.engine
+import config
+import logging
+import util
+import os
+import numpy as np
+import nn
+import soundfile as sf
+import stft
+
+
+def train():
+    logging.info('train bss model')
+    sig1_list = util.load_data(config.DATA_TRAIN_LIST, config.DATA_TRAIN_ROOT)
+    sig2 = util.read_wav(config.DATA_TRAIN_STATIC_SIGNAL)
+    print('sig1_list is', sig1_list)
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TRAIN_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TRAIN_LIST,
+                                      config.DATA_TRAIN_STATIC_SIGNAL,
+                                      config.DATA_TRAIN_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list, sig2_list,
+                                              output=mix_filenames)
+
+    logging.info('extract stft features')
+    # sig1_stft = _extract_stft(sig1_list)
+    # sig2_stft = _extract_stft(sig2_list)
+    # mix_stft = _extract_stft(mix_list)
+    eng = matlab.engine.start_matlab()
+    print('sig1_list is', sig1_list)
+    sig1_list = matlab.double(list(sig1_list))
+    sig1_stft = eng.MRCG_features(sig1_list, 16000)
+    sig2_stf = eng.MRCG_features((sig2_list), 16000)
+    mix_stft = eng.MRCG_features((mix_list), 16000)
+    
+
+    logging.info('train neural network')
+    sig1_stft = util.r_abs(sig1_stft)
+    sig2_stft = util.r_abs(sig2_stft)
+    mix_stft = util.r_abs(mix_stft)
+    train_x, train_y = mix_stft, []
+    for s, n in zip(sig1_stft, sig2_stft):  # 将signal和noise拼接作为nn输出
+        train_y.append(np.concatenate((s, n), axis=1))
+    train_x = [_extend(sig, config.EXTEND_NUM) for sig in train_x]
+
+    # 各层神经元数量
+    layer_size = [len(train_x[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(train_y[0][0]))  # 输出层
+
+    dnn = nn.NNet(layer_size)
+    util.mkdir_p(config.MODEL_ROOT)
+    dnn.train(train_x, train_y, model_path=config.MODEL_NN_PATH,
+              training_epochs=config.EPOCH, learning_rate=config.LEARNING_RATE)
+    # dnn.test(train_x, train_y, model_path=config.MODEL_DN_NN_PATH)
+
+
+def _normalize(sig):
+    sig = np.array(sig)
+    return sig / np.sqrt(np.sum(sig ** 2))
+
+
+def _extend(sig, increment):
+    '''
+    将每帧与前后帧连结
+    :param sig: 信号
+    :param increment: 前/后连结帧数量
+    :return:
+    '''
+    recurrent_train_x = []
+    for i in range(len(sig)):  # 帧数
+        temp = []
+        for k in range(i - increment, i + increment + 1):
+            if k < 0 or k >= len(sig):
+                temp.extend(np.zeros(len(sig[i])))
+            else:
+                temp.extend(sig[k])
+        temp_2 = np.array(temp)
+        recurrent_train_x.append(temp_2)
+    return recurrent_train_x
+
+
+def _extract_stft(audios):
+    stfts = []
+    for ad in audios:
+        st = stft.spectrogram(ad, framelength=config.STFT_POINT,
+                              overlap=config.STFT_OVERLAP)
+        st = st.transpose()
+        stfts.append(st)
+    return stfts
+
+
+def test():
+    logging.info('test denoising model')
+    logging.info("read test signal according to %s, read noise from %s" %
+                 (config.DATA_TEST_LIST, config.DATA_TEST_STATIC_SIGNAL))
+    sig1_list = util.load_data(config.DATA_TEST_LIST, config.DATA_TEST_ROOT)
+    sig2 = util.read_wav(config.DATA_TEST_STATIC_SIGNAL)
+
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TEST_LIST,
+                                      config.DATA_TEST_STATIC_SIGNAL,
+                                      config.DATA_TEST_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list,
+                                              sig2_list, output=mix_filenames)
+
+    logging.info('extract stft features')
+    mix_stft = _extract_stft(mix_list)
+
+    mix_data = util.r_abs(mix_stft)
+    mix_data = [_extend(sig, config.EXTEND_NUM) for sig in mix_data]
+
+    logging.info('run neural network')
+    # 各层神经元数量
+    layer_size = [len(mix_data[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(mix_stft[0][0]) * 2)  # 输出层
+    dnn = nn.NNet(layer_size)
+    sig1_sig2 = dnn.run(mix_data, model_path=config.MODEL_NN_PATH)
+    # 神经网络输出为预测signal1与signal2的拼接，此处分离
+    sig1_stft, sig2_stft = _separate(sig1_sig2)
+
+    logging.info('Time-Frequency Masking')
+    mask = []
+    for s, n in zip(sig1_stft, sig2_stft):
+        mask.append(_build_ibm(s, n))
+    sig1_stft = [np.multiply(mix, m) for mix, m in zip(mix_stft, mask)]
+    sig2_stft = [np.subtract(mix, sig) for mix, sig in zip(mix_stft, sig1_stft)
+                 ]
+    logging.info('Inverse Short-Time Fourier Transformation')
+    # 从频域转换到时域
+    sep_sig1 = _istft(sig1_stft)
+    sep_sig2 = _istft(sig2_stft)
+
+    logging.info("write test audio into dir %s" % config.DATA_TEST_MIX_ROOT)
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    for ss, sn, f in zip(sep_sig1, sep_sig2, file_list):
+        sf.write(f + '.sep.sig1.wav', ss, config.SAMPLE_RATE)
+        sf.write(f + '.sep.sig2.wav', sn, config.SAMPLE_RATE)
+
+    logging.info('run bss evaluation')
+    sdr, sir, sar = _bss_eval()
+    logging.info('SDR: %g, SIR: %g, SAR: %g' % (sdr, sir, sar))
+
+
+def _build_ibm(sig1, sig2):
+    # 创建 ideal binary mask
+    # TODO deal with snr != 0
+    ibm = []
+    for s1, s2 in zip(sig1, sig2):
+        s1, s2 = np.abs(s1), np.abs(s2)
+        # bool object has no astype attribute
+        i = (s1 > s2).astype(np.float64)
+        ibm.append(i)
+    return ibm
+
+
+def _istft(stft_matrix_list):
+    '''
+    Inverse Short-Time Fourier Transformation
+    '''
+    audios = []
+    for sm in stft_matrix_list:
+        sm = np.transpose(sm)
+        ad = stft.ispectrogram(sm, framelength=config.STFT_POINT,
+                               overlap=config.STFT_OVERLAP)
+        audios.append(ad)
+    return audios
+
+
+def _bss_eval():
+    '''
+    通过调用Matlab BSS_EVAL工具进行表现评估
+    :return: sdr、sir、sar三个指标均值
+    '''
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    logging.info('connect to matlab')
+
+    avg_sdr, avg_sir, avg_sar = 0., 0., 0.
+    eng = matlab.engine.start_matlab()
+
+    for filepath in file_list:
+        sig1_wav = filepath + '.sig1.wav'
+        sig2_wav = filepath + '.sig2.wav'
+        sep_sig1_wav = filepath + '.sep.sig1.wav'
+        sep_sig2_wav = filepath + '.sep.sig2.wav'
+        mix_wav = filepath + '.mix.wav'
+        # matlab执行bss_eval.m
+        sdr, sir, sar = eng.bss_eval(sig1_wav, sig2_wav, sep_sig1_wav,
+                                     sep_sig2_wav, mix_wav, nargout=3)
+        avg_sdr += sdr / len(file_list)
+        avg_sir += sir / len(file_list)
+        avg_sar += sar / len(file_list)
+
+    return avg_sdr, avg_sir, avg_sar
+
+
+def _separate(X_list):
+    # 把 X_list 的每行均分成两半
+    a, b = [], []
+    for X in X_list:
+        a.append([row[:int(len(row) / 2)] for row in X])
+        b.append([row[int(len(row) / 2):] for row in X])
+
+    return a, b
+
+
+def _gen_mix_filename(sig1_list_csv, sig2_path, mix_dir):
+    '''
+    生成混合音频文件的路径str
+    :param sig1_list_csv: csv文件，第一列记录音频文件名
+    :param sig2_path: 另一个音源文件目录
+    :param mix_dir: 混合音频保存目录
+    :return:
+    '''
+    mix_file_list = []
+    signals_file_list = util.read_csv(sig1_list_csv)
+    sig2_fillename = os.path.basename(sig2_path).split('.')[0]
+    for sig1_file in signals_file_list:
+        sig1_filename = os.path.splitext(sig1_file[0])[0]
+        mix_file_list.append('%s/%s+%s' %
+                             (mix_dir, sig1_filename, sig2_fillename))
+    return mix_file_list
+
+
+def log_config():
+    with open(config.LOG_FILENAME, 'a', encoding='utf-8') as log:
+        log.write('config.py-----------------------------------------------\n')
+        with open('config.py', 'r', encoding='utf-8') as cf:
+            for line in cf:
+                log.write(line)
+        log.write('\n\n')
+        log.write('%s---------------------------------------------------\n'
+                  % config.RUN_SCRIPT)
+        with open(config.RUN_SCRIPT, 'r', encoding='utf-8') as scp:
+            for line in scp:
+                log.write(line)
+        log.write('\n\n')
+
+
+if __name__ == "__main__":
+    log_config()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TRAIN_ROOT)
+    util.create_more_signals(config.DATA_TRAIN_LOOP_SIGNAL,
+                             config.DATA_TRAIN_ROOT, config.DATA_TRAIN_LIST)
+    train()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TEST_ROOT)
+    util.create_more_signals(config.DATA_TEST_LOOP_SIGNAL,
+                             config.DATA_TEST_ROOT,
+                             config.DATA_TEST_LIST)
+    test()
+
+
+2017-03-17 10:32:38,800::INFO::create train loop signals
+2017-03-17 10:32:39,012::INFO::train bss model
+2017-03-17 10:32:39,325::INFO::mix signals
+2017-03-17 10:32:40,064::INFO::extract stft features
+config.py-----------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+运行参数配置，包括日志，数据文件，模型文件，模型参数等
+"""
+
+import logging
+import inspect
+import os
+
+################################
+# 日志配置
+_run_script = inspect.stack()[-1][1]
+# 运行脚本名
+RUN_SCRIPT = os.path.basename(_run_script)
+_run_script_no_ext = os.path.splitext(RUN_SCRIPT)[0]
+# 日志文件名
+LOG_FILENAME = '%s.log' % _run_script_no_ext
+
+# 配置日志输出文件及级别
+FORMAT = '%(asctime)s::%(levelname)s::%(message)s'
+logging.basicConfig(filename=LOG_FILENAME, level=logging.INFO, format=FORMAT,
+                    filemode='a')
+
+# 同时输出到控制台
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter(FORMAT))
+logging.getLogger('').addHandler(console)
+
+################################
+# 数据目录与文件路径
+# 数据根目录
+DATA_ROOT = './data'
+
+# 训练数据
+DATA_TRAIN_ROOT = DATA_ROOT + '/male_train'
+# csv文件，第一列为训练wav文件名
+DATA_TRAIN_LIST = DATA_TRAIN_ROOT + '/data.csv'
+# 混合后数据目录
+DATA_TRAIN_MIX_ROOT = DATA_ROOT + '/train.mix'
+
+# 测试数据，参考训练数据
+DATA_TEST_ROOT = DATA_ROOT + '/male_test'
+DATA_TEST_LIST = DATA_TEST_ROOT + '/data.csv'
+DATA_TEST_MIX_ROOT = DATA_ROOT + '/test.mix'
+
+# 用于循环得到更多的信号
+DATA_TRAIN_LOOP_SIGNAL = DATA_ROOT + '/male_train.wav'
+DATA_TEST_LOOP_SIGNAL = DATA_ROOT + '/male_test.wav'
+
+# 训练与测试信号
+DATA_TRAIN_STATIC_SIGNAL = DATA_ROOT + '/female_train.wav'
+DATA_TEST_STATIC_SIGNAL = DATA_ROOT + '/female_test.wav'
+
+################################
+# 模型存放目录与文件路径
+MODEL_ROOT = './model'
+# 神经网络模型
+MODEL_NN_PATH = MODEL_ROOT + '/neural_net.model'
+
+################################
+# 训练参数配置
+# wav采样率
+SAMPLE_RATE = 16000
+# STFT每帧点数
+STFT_POINT = 1024
+# STFT每帧重叠 1/DN_STFT_OVERLAP
+STFT_OVERLAP = 2
+# 神经网络隐藏层每层激活元数量
+LAYER_SIZE = [16]
+# 模型训练次数
+EPOCH = 100
+# 神经网络输入，每帧前/后扩展数
+EXTEND_NUM = 0
+# 神经网络学习速率
+LEARNING_RATE = 0.001
+# 是否正则化
+NORMALIZATION = True
+
+
+dnn4bss.py---------------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+基于神经网络的盲源分离模型
+
+参考：
+P.-S. Huang, M. Kim, M. Hasegawa-Johnson, P. Smaragdis, "Deep Learning for
+Monaural Speech Separation,"
+in IEEE International Conference on Acoustic,
+Speech and Signal Processing 2014.
+"""
+
+import matlab.engine
+import config
+import logging
+import util
+import os
+import numpy as np
+import nn
+import soundfile as sf
+import stft
+
+
+def train():
+    logging.info('train bss model')
+    sig1_list = util.load_data(config.DATA_TRAIN_LIST, config.DATA_TRAIN_ROOT)
+    sig2 = util.read_wav(config.DATA_TRAIN_STATIC_SIGNAL)
+    print('sig1_list is', sig1_list)
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TRAIN_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TRAIN_LIST,
+                                      config.DATA_TRAIN_STATIC_SIGNAL,
+                                      config.DATA_TRAIN_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list, sig2_list,
+                                              output=mix_filenames)
+
+    logging.info('extract stft features')
+    # sig1_stft = _extract_stft(sig1_list)
+    # sig2_stft = _extract_stft(sig2_list)
+    # mix_stft = _extract_stft(mix_list)
+    eng = matlab.engine.start_matlab()
+    # print('sig1_list is', sig1_list)
+    sig1_list = matlab.double(sig1_list)
+    sig1_stft = eng.MRCG_features(sig1_list, 16000)
+    sig2_stf = eng.MRCG_features((sig2_list), 16000)
+    mix_stft = eng.MRCG_features((mix_list), 16000)
+    
+
+    logging.info('train neural network')
+    sig1_stft = util.r_abs(sig1_stft)
+    sig2_stft = util.r_abs(sig2_stft)
+    mix_stft = util.r_abs(mix_stft)
+    train_x, train_y = mix_stft, []
+    for s, n in zip(sig1_stft, sig2_stft):  # 将signal和noise拼接作为nn输出
+        train_y.append(np.concatenate((s, n), axis=1))
+    train_x = [_extend(sig, config.EXTEND_NUM) for sig in train_x]
+
+    # 各层神经元数量
+    layer_size = [len(train_x[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(train_y[0][0]))  # 输出层
+
+    dnn = nn.NNet(layer_size)
+    util.mkdir_p(config.MODEL_ROOT)
+    dnn.train(train_x, train_y, model_path=config.MODEL_NN_PATH,
+              training_epochs=config.EPOCH, learning_rate=config.LEARNING_RATE)
+    # dnn.test(train_x, train_y, model_path=config.MODEL_DN_NN_PATH)
+
+
+def _normalize(sig):
+    sig = np.array(sig)
+    return sig / np.sqrt(np.sum(sig ** 2))
+
+
+def _extend(sig, increment):
+    '''
+    将每帧与前后帧连结
+    :param sig: 信号
+    :param increment: 前/后连结帧数量
+    :return:
+    '''
+    recurrent_train_x = []
+    for i in range(len(sig)):  # 帧数
+        temp = []
+        for k in range(i - increment, i + increment + 1):
+            if k < 0 or k >= len(sig):
+                temp.extend(np.zeros(len(sig[i])))
+            else:
+                temp.extend(sig[k])
+        temp_2 = np.array(temp)
+        recurrent_train_x.append(temp_2)
+    return recurrent_train_x
+
+
+def _extract_stft(audios):
+    stfts = []
+    for ad in audios:
+        st = stft.spectrogram(ad, framelength=config.STFT_POINT,
+                              overlap=config.STFT_OVERLAP)
+        st = st.transpose()
+        stfts.append(st)
+    return stfts
+
+
+def test():
+    logging.info('test denoising model')
+    logging.info("read test signal according to %s, read noise from %s" %
+                 (config.DATA_TEST_LIST, config.DATA_TEST_STATIC_SIGNAL))
+    sig1_list = util.load_data(config.DATA_TEST_LIST, config.DATA_TEST_ROOT)
+    sig2 = util.read_wav(config.DATA_TEST_STATIC_SIGNAL)
+
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TEST_LIST,
+                                      config.DATA_TEST_STATIC_SIGNAL,
+                                      config.DATA_TEST_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list,
+                                              sig2_list, output=mix_filenames)
+
+    logging.info('extract stft features')
+    mix_stft = _extract_stft(mix_list)
+
+    mix_data = util.r_abs(mix_stft)
+    mix_data = [_extend(sig, config.EXTEND_NUM) for sig in mix_data]
+
+    logging.info('run neural network')
+    # 各层神经元数量
+    layer_size = [len(mix_data[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(mix_stft[0][0]) * 2)  # 输出层
+    dnn = nn.NNet(layer_size)
+    sig1_sig2 = dnn.run(mix_data, model_path=config.MODEL_NN_PATH)
+    # 神经网络输出为预测signal1与signal2的拼接，此处分离
+    sig1_stft, sig2_stft = _separate(sig1_sig2)
+
+    logging.info('Time-Frequency Masking')
+    mask = []
+    for s, n in zip(sig1_stft, sig2_stft):
+        mask.append(_build_ibm(s, n))
+    sig1_stft = [np.multiply(mix, m) for mix, m in zip(mix_stft, mask)]
+    sig2_stft = [np.subtract(mix, sig) for mix, sig in zip(mix_stft, sig1_stft)
+                 ]
+    logging.info('Inverse Short-Time Fourier Transformation')
+    # 从频域转换到时域
+    sep_sig1 = _istft(sig1_stft)
+    sep_sig2 = _istft(sig2_stft)
+
+    logging.info("write test audio into dir %s" % config.DATA_TEST_MIX_ROOT)
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    for ss, sn, f in zip(sep_sig1, sep_sig2, file_list):
+        sf.write(f + '.sep.sig1.wav', ss, config.SAMPLE_RATE)
+        sf.write(f + '.sep.sig2.wav', sn, config.SAMPLE_RATE)
+
+    logging.info('run bss evaluation')
+    sdr, sir, sar = _bss_eval()
+    logging.info('SDR: %g, SIR: %g, SAR: %g' % (sdr, sir, sar))
+
+
+def _build_ibm(sig1, sig2):
+    # 创建 ideal binary mask
+    # TODO deal with snr != 0
+    ibm = []
+    for s1, s2 in zip(sig1, sig2):
+        s1, s2 = np.abs(s1), np.abs(s2)
+        # bool object has no astype attribute
+        i = (s1 > s2).astype(np.float64)
+        ibm.append(i)
+    return ibm
+
+
+def _istft(stft_matrix_list):
+    '''
+    Inverse Short-Time Fourier Transformation
+    '''
+    audios = []
+    for sm in stft_matrix_list:
+        sm = np.transpose(sm)
+        ad = stft.ispectrogram(sm, framelength=config.STFT_POINT,
+                               overlap=config.STFT_OVERLAP)
+        audios.append(ad)
+    return audios
+
+
+def _bss_eval():
+    '''
+    通过调用Matlab BSS_EVAL工具进行表现评估
+    :return: sdr、sir、sar三个指标均值
+    '''
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    logging.info('connect to matlab')
+
+    avg_sdr, avg_sir, avg_sar = 0., 0., 0.
+    eng = matlab.engine.start_matlab()
+
+    for filepath in file_list:
+        sig1_wav = filepath + '.sig1.wav'
+        sig2_wav = filepath + '.sig2.wav'
+        sep_sig1_wav = filepath + '.sep.sig1.wav'
+        sep_sig2_wav = filepath + '.sep.sig2.wav'
+        mix_wav = filepath + '.mix.wav'
+        # matlab执行bss_eval.m
+        sdr, sir, sar = eng.bss_eval(sig1_wav, sig2_wav, sep_sig1_wav,
+                                     sep_sig2_wav, mix_wav, nargout=3)
+        avg_sdr += sdr / len(file_list)
+        avg_sir += sir / len(file_list)
+        avg_sar += sar / len(file_list)
+
+    return avg_sdr, avg_sir, avg_sar
+
+
+def _separate(X_list):
+    # 把 X_list 的每行均分成两半
+    a, b = [], []
+    for X in X_list:
+        a.append([row[:int(len(row) / 2)] for row in X])
+        b.append([row[int(len(row) / 2):] for row in X])
+
+    return a, b
+
+
+def _gen_mix_filename(sig1_list_csv, sig2_path, mix_dir):
+    '''
+    生成混合音频文件的路径str
+    :param sig1_list_csv: csv文件，第一列记录音频文件名
+    :param sig2_path: 另一个音源文件目录
+    :param mix_dir: 混合音频保存目录
+    :return:
+    '''
+    mix_file_list = []
+    signals_file_list = util.read_csv(sig1_list_csv)
+    sig2_fillename = os.path.basename(sig2_path).split('.')[0]
+    for sig1_file in signals_file_list:
+        sig1_filename = os.path.splitext(sig1_file[0])[0]
+        mix_file_list.append('%s/%s+%s' %
+                             (mix_dir, sig1_filename, sig2_fillename))
+    return mix_file_list
+
+
+def log_config():
+    with open(config.LOG_FILENAME, 'a', encoding='utf-8') as log:
+        log.write('config.py-----------------------------------------------\n')
+        with open('config.py', 'r', encoding='utf-8') as cf:
+            for line in cf:
+                log.write(line)
+        log.write('\n\n')
+        log.write('%s---------------------------------------------------\n'
+                  % config.RUN_SCRIPT)
+        with open(config.RUN_SCRIPT, 'r', encoding='utf-8') as scp:
+            for line in scp:
+                log.write(line)
+        log.write('\n\n')
+
+
+if __name__ == "__main__":
+    log_config()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TRAIN_ROOT)
+    util.create_more_signals(config.DATA_TRAIN_LOOP_SIGNAL,
+                             config.DATA_TRAIN_ROOT, config.DATA_TRAIN_LIST)
+    train()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TEST_ROOT)
+    util.create_more_signals(config.DATA_TEST_LOOP_SIGNAL,
+                             config.DATA_TEST_ROOT,
+                             config.DATA_TEST_LIST)
+    test()
+
+
+2017-03-17 10:33:39,530::INFO::create train loop signals
+2017-03-17 10:33:39,735::INFO::train bss model
+2017-03-17 10:33:40,038::INFO::mix signals
+2017-03-17 10:33:40,771::INFO::extract stft features
+config.py-----------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+运行参数配置，包括日志，数据文件，模型文件，模型参数等
+"""
+
+import logging
+import inspect
+import os
+
+################################
+# 日志配置
+_run_script = inspect.stack()[-1][1]
+# 运行脚本名
+RUN_SCRIPT = os.path.basename(_run_script)
+_run_script_no_ext = os.path.splitext(RUN_SCRIPT)[0]
+# 日志文件名
+LOG_FILENAME = '%s.log' % _run_script_no_ext
+
+# 配置日志输出文件及级别
+FORMAT = '%(asctime)s::%(levelname)s::%(message)s'
+logging.basicConfig(filename=LOG_FILENAME, level=logging.INFO, format=FORMAT,
+                    filemode='a')
+
+# 同时输出到控制台
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter(FORMAT))
+logging.getLogger('').addHandler(console)
+
+################################
+# 数据目录与文件路径
+# 数据根目录
+DATA_ROOT = './data'
+
+# 训练数据
+DATA_TRAIN_ROOT = DATA_ROOT + '/male_train'
+# csv文件，第一列为训练wav文件名
+DATA_TRAIN_LIST = DATA_TRAIN_ROOT + '/data.csv'
+# 混合后数据目录
+DATA_TRAIN_MIX_ROOT = DATA_ROOT + '/train.mix'
+
+# 测试数据，参考训练数据
+DATA_TEST_ROOT = DATA_ROOT + '/male_test'
+DATA_TEST_LIST = DATA_TEST_ROOT + '/data.csv'
+DATA_TEST_MIX_ROOT = DATA_ROOT + '/test.mix'
+
+# 用于循环得到更多的信号
+DATA_TRAIN_LOOP_SIGNAL = DATA_ROOT + '/male_train.wav'
+DATA_TEST_LOOP_SIGNAL = DATA_ROOT + '/male_test.wav'
+
+# 训练与测试信号
+DATA_TRAIN_STATIC_SIGNAL = DATA_ROOT + '/female_train.wav'
+DATA_TEST_STATIC_SIGNAL = DATA_ROOT + '/female_test.wav'
+
+################################
+# 模型存放目录与文件路径
+MODEL_ROOT = './model'
+# 神经网络模型
+MODEL_NN_PATH = MODEL_ROOT + '/neural_net.model'
+
+################################
+# 训练参数配置
+# wav采样率
+SAMPLE_RATE = 16000
+# STFT每帧点数
+STFT_POINT = 1024
+# STFT每帧重叠 1/DN_STFT_OVERLAP
+STFT_OVERLAP = 2
+# 神经网络隐藏层每层激活元数量
+LAYER_SIZE = [16]
+# 模型训练次数
+EPOCH = 100
+# 神经网络输入，每帧前/后扩展数
+EXTEND_NUM = 0
+# 神经网络学习速率
+LEARNING_RATE = 0.001
+# 是否正则化
+NORMALIZATION = True
+
+
+dnn4bss.py---------------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+基于神经网络的盲源分离模型
+
+参考：
+P.-S. Huang, M. Kim, M. Hasegawa-Johnson, P. Smaragdis, "Deep Learning for
+Monaural Speech Separation,"
+in IEEE International Conference on Acoustic,
+Speech and Signal Processing 2014.
+"""
+
+import matlab.engine
+import config
+import logging
+import util
+import os
+import numpy as np
+import nn
+import soundfile as sf
+import stft
+
+
+def train():
+    logging.info('train bss model')
+    sig1_list = util.load_data(config.DATA_TRAIN_LIST, config.DATA_TRAIN_ROOT)
+    sig2 = util.read_wav(config.DATA_TRAIN_STATIC_SIGNAL)
+    print('sig1_list is', sig1_list)
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TRAIN_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TRAIN_LIST,
+                                      config.DATA_TRAIN_STATIC_SIGNAL,
+                                      config.DATA_TRAIN_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list, sig2_list,
+                                              output=mix_filenames)
+
+    logging.info('extract stft features')
+    # sig1_stft = _extract_stft(sig1_list)
+    # sig2_stft = _extract_stft(sig2_list)
+    # mix_stft = _extract_stft(mix_list)
+    eng = matlab.engine.start_matlab()
+    # print('sig1_list is', sig1_list)
+    sig1_list = matlab.double(sig1_list)
+    sig1_stft = eng.MRCG_features(sig1_list, 16000)
+    sig2_stf = eng.MRCG_features((sig2_list), 16000)
+    mix_stft = eng.MRCG_features((mix_list), 16000)
+    
+
+    logging.info('train neural network')
+    sig1_stft = util.r_abs(sig1_stft)
+    sig2_stft = util.r_abs(sig2_stft)
+    mix_stft = util.r_abs(mix_stft)
+    train_x, train_y = mix_stft, []
+    for s, n in zip(sig1_stft, sig2_stft):  # 将signal和noise拼接作为nn输出
+        train_y.append(np.concatenate((s, n), axis=1))
+    train_x = [_extend(sig, config.EXTEND_NUM) for sig in train_x]
+
+    # 各层神经元数量
+    layer_size = [len(train_x[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(train_y[0][0]))  # 输出层
+
+    dnn = nn.NNet(layer_size)
+    util.mkdir_p(config.MODEL_ROOT)
+    dnn.train(train_x, train_y, model_path=config.MODEL_NN_PATH,
+              training_epochs=config.EPOCH, learning_rate=config.LEARNING_RATE)
+    # dnn.test(train_x, train_y, model_path=config.MODEL_DN_NN_PATH)
+
+
+def _normalize(sig):
+    sig = np.array(sig)
+    return sig / np.sqrt(np.sum(sig ** 2))
+
+
+def _extend(sig, increment):
+    '''
+    将每帧与前后帧连结
+    :param sig: 信号
+    :param increment: 前/后连结帧数量
+    :return:
+    '''
+    recurrent_train_x = []
+    for i in range(len(sig)):  # 帧数
+        temp = []
+        for k in range(i - increment, i + increment + 1):
+            if k < 0 or k >= len(sig):
+                temp.extend(np.zeros(len(sig[i])))
+            else:
+                temp.extend(sig[k])
+        temp_2 = np.array(temp)
+        recurrent_train_x.append(temp_2)
+    return recurrent_train_x
+
+
+def _extract_stft(audios):
+    stfts = []
+    for ad in audios:
+        st = stft.spectrogram(ad, framelength=config.STFT_POINT,
+                              overlap=config.STFT_OVERLAP)
+        st = st.transpose()
+        stfts.append(st)
+    return stfts
+
+
+def test():
+    logging.info('test denoising model')
+    logging.info("read test signal according to %s, read noise from %s" %
+                 (config.DATA_TEST_LIST, config.DATA_TEST_STATIC_SIGNAL))
+    sig1_list = util.load_data(config.DATA_TEST_LIST, config.DATA_TEST_ROOT)
+    sig2 = util.read_wav(config.DATA_TEST_STATIC_SIGNAL)
+
+    if config.NORMALIZATION:
+        sig1_list = [_normalize(sig) for sig in sig1_list]
+        sig2 = _normalize(sig2)
+
+    logging.info('mix signals')
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    mix_filenames = _gen_mix_filename(config.DATA_TEST_LIST,
+                                      config.DATA_TEST_STATIC_SIGNAL,
+                                      config.DATA_TEST_MIX_ROOT)
+    sig2_list = [sig2 for _ in range(len(sig1_list))]
+    sig1_list, sig2_list, mix_list = util.mix(sig1_list,
+                                              sig2_list, output=mix_filenames)
+
+    logging.info('extract stft features')
+    mix_stft = _extract_stft(mix_list)
+
+    mix_data = util.r_abs(mix_stft)
+    mix_data = [_extend(sig, config.EXTEND_NUM) for sig in mix_data]
+
+    logging.info('run neural network')
+    # 各层神经元数量
+    layer_size = [len(mix_data[0][0])]  # 输入层
+    layer_size.extend(config.LAYER_SIZE)  # 隐藏层
+    layer_size.append(len(mix_stft[0][0]) * 2)  # 输出层
+    dnn = nn.NNet(layer_size)
+    sig1_sig2 = dnn.run(mix_data, model_path=config.MODEL_NN_PATH)
+    # 神经网络输出为预测signal1与signal2的拼接，此处分离
+    sig1_stft, sig2_stft = _separate(sig1_sig2)
+
+    logging.info('Time-Frequency Masking')
+    mask = []
+    for s, n in zip(sig1_stft, sig2_stft):
+        mask.append(_build_ibm(s, n))
+    sig1_stft = [np.multiply(mix, m) for mix, m in zip(mix_stft, mask)]
+    sig2_stft = [np.subtract(mix, sig) for mix, sig in zip(mix_stft, sig1_stft)
+                 ]
+    logging.info('Inverse Short-Time Fourier Transformation')
+    # 从频域转换到时域
+    sep_sig1 = _istft(sig1_stft)
+    sep_sig2 = _istft(sig2_stft)
+
+    logging.info("write test audio into dir %s" % config.DATA_TEST_MIX_ROOT)
+    util.mkdir_p(config.DATA_TEST_MIX_ROOT)
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    for ss, sn, f in zip(sep_sig1, sep_sig2, file_list):
+        sf.write(f + '.sep.sig1.wav', ss, config.SAMPLE_RATE)
+        sf.write(f + '.sep.sig2.wav', sn, config.SAMPLE_RATE)
+
+    logging.info('run bss evaluation')
+    sdr, sir, sar = _bss_eval()
+    logging.info('SDR: %g, SIR: %g, SAR: %g' % (sdr, sir, sar))
+
+
+def _build_ibm(sig1, sig2):
+    # 创建 ideal binary mask
+    # TODO deal with snr != 0
+    ibm = []
+    for s1, s2 in zip(sig1, sig2):
+        s1, s2 = np.abs(s1), np.abs(s2)
+        # bool object has no astype attribute
+        i = (s1 > s2).astype(np.float64)
+        ibm.append(i)
+    return ibm
+
+
+def _istft(stft_matrix_list):
+    '''
+    Inverse Short-Time Fourier Transformation
+    '''
+    audios = []
+    for sm in stft_matrix_list:
+        sm = np.transpose(sm)
+        ad = stft.ispectrogram(sm, framelength=config.STFT_POINT,
+                               overlap=config.STFT_OVERLAP)
+        audios.append(ad)
+    return audios
+
+
+def _bss_eval():
+    '''
+    通过调用Matlab BSS_EVAL工具进行表现评估
+    :return: sdr、sir、sar三个指标均值
+    '''
+    file_list = _gen_mix_filename(config.DATA_TEST_LIST,
+                                  config.DATA_TEST_STATIC_SIGNAL,
+                                  config.DATA_TEST_MIX_ROOT)
+    logging.info('connect to matlab')
+
+    avg_sdr, avg_sir, avg_sar = 0., 0., 0.
+    eng = matlab.engine.start_matlab()
+
+    for filepath in file_list:
+        sig1_wav = filepath + '.sig1.wav'
+        sig2_wav = filepath + '.sig2.wav'
+        sep_sig1_wav = filepath + '.sep.sig1.wav'
+        sep_sig2_wav = filepath + '.sep.sig2.wav'
+        mix_wav = filepath + '.mix.wav'
+        # matlab执行bss_eval.m
+        sdr, sir, sar = eng.bss_eval(sig1_wav, sig2_wav, sep_sig1_wav,
+                                     sep_sig2_wav, mix_wav, nargout=3)
+        avg_sdr += sdr / len(file_list)
+        avg_sir += sir / len(file_list)
+        avg_sar += sar / len(file_list)
+
+    return avg_sdr, avg_sir, avg_sar
+
+
+def _separate(X_list):
+    # 把 X_list 的每行均分成两半
+    a, b = [], []
+    for X in X_list:
+        a.append([row[:int(len(row) / 2)] for row in X])
+        b.append([row[int(len(row) / 2):] for row in X])
+
+    return a, b
+
+
+def _gen_mix_filename(sig1_list_csv, sig2_path, mix_dir):
+    '''
+    生成混合音频文件的路径str
+    :param sig1_list_csv: csv文件，第一列记录音频文件名
+    :param sig2_path: 另一个音源文件目录
+    :param mix_dir: 混合音频保存目录
+    :return:
+    '''
+    mix_file_list = []
+    signals_file_list = util.read_csv(sig1_list_csv)
+    sig2_fillename = os.path.basename(sig2_path).split('.')[0]
+    for sig1_file in signals_file_list:
+        sig1_filename = os.path.splitext(sig1_file[0])[0]
+        mix_file_list.append('%s/%s+%s' %
+                             (mix_dir, sig1_filename, sig2_fillename))
+    return mix_file_list
+
+
+def log_config():
+    with open(config.LOG_FILENAME, 'a', encoding='utf-8') as log:
+        log.write('config.py-----------------------------------------------\n')
+        with open('config.py', 'r', encoding='utf-8') as cf:
+            for line in cf:
+                log.write(line)
+        log.write('\n\n')
+        log.write('%s---------------------------------------------------\n'
+                  % config.RUN_SCRIPT)
+        with open(config.RUN_SCRIPT, 'r', encoding='utf-8') as scp:
+            for line in scp:
+                log.write(line)
+        log.write('\n\n')
+
+
+if __name__ == "__main__":
+    log_config()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TRAIN_ROOT)
+    util.create_more_signals(config.DATA_TRAIN_LOOP_SIGNAL,
+                             config.DATA_TRAIN_ROOT, config.DATA_TRAIN_LIST)
+    train()
+
+    logging.info('create train loop signals')
+    util.mkdir_p(config.DATA_TEST_ROOT)
+    util.create_more_signals(config.DATA_TEST_LOOP_SIGNAL,
+                             config.DATA_TEST_ROOT,
+                             config.DATA_TEST_LIST)
+    test()
+
+
+2017-03-17 10:33:58,791::INFO::create train loop signals
+2017-03-17 10:33:59,015::INFO::train bss model
+2017-03-17 10:33:59,511::INFO::mix signals
+2017-03-17 10:34:00,611::INFO::extract stft features
+2017-03-20 10:25:37,474::INFO::create train loop signals
+2017-03-20 10:25:37,693::INFO::train bss model
+2017-03-20 10:33:33,843::INFO::create train loop signals
+2017-03-20 10:33:34,066::INFO::train bss model
+2017-03-20 11:31:06,768::INFO::create train loop signals
+2017-03-20 11:31:06,984::INFO::train bss model
+2017-03-20 11:33:17,916::INFO::create train loop signals
+2017-03-20 11:33:18,116::INFO::train bss model
+2017-03-20 11:34:15,716::INFO::create train loop signals
+2017-03-20 11:34:15,916::INFO::train bss model
+2017-03-20 11:38:57,461::INFO::create train loop signals
+2017-03-20 11:38:57,659::INFO::train bss model
+2017-03-20 11:40:14,537::INFO::create train loop signals
+2017-03-20 11:40:14,739::INFO::train bss model
+2017-03-20 11:48:59,860::INFO::create train loop signals
+2017-03-20 11:49:00,064::INFO::train bss model
+2017-03-20 11:49:00,381::INFO::mix signals
+2017-03-20 11:49:01,228::INFO::extract stft features
+2017-03-20 11:49:05,653::INFO::train neural network
+2017-03-20 11:49:57,284::INFO::train neural network with 45 sample(s)
+2017-03-20 11:49:58,862::INFO::Epoch: 0001 cost= 14.963974826
+2017-03-20 11:50:00,334::INFO::Epoch: 0002 cost= 8.756097497
+2017-03-20 11:50:02,241::INFO::Epoch: 0003 cost= 5.811377822
+2017-03-20 11:50:03,651::INFO::Epoch: 0004 cost= 4.233293962
+2017-03-20 11:50:19,513::INFO::create train loop signals
+2017-03-20 11:50:19,734::INFO::train bss model
+2017-03-20 11:50:20,084::INFO::mix signals
+2017-03-20 11:50:20,844::INFO::extract stft features
+2017-03-20 11:53:37,170::INFO::create train loop signals
+2017-03-20 11:53:37,394::INFO::train bss model
+2017-03-20 11:53:37,891::INFO::mix signals
+2017-03-20 11:53:38,782::INFO::extract stft features
+2017-03-20 11:53:43,851::INFO::train neural network
+2017-03-20 12:07:41,961::INFO::create train loop signals
+2017-03-20 12:07:42,205::INFO::train bss model
+2017-03-20 12:08:47,427::INFO::create train loop signals
+2017-03-20 12:08:47,628::INFO::train bss model
+2017-03-20 12:10:01,619::INFO::create train loop signals
+2017-03-20 12:10:01,821::INFO::train bss model
+2017-03-20 14:07:42,348::INFO::create train loop signals
+2017-03-20 14:07:42,564::INFO::train bss model
+2017-03-20 14:08:29,640::INFO::create train loop signals
+2017-03-20 14:08:29,865::INFO::train bss model
+2017-03-20 14:11:50,303::INFO::create train loop signals
+2017-03-20 14:11:50,529::INFO::train bss model
+2017-03-20 14:17:53,505::INFO::create train loop signals
+2017-03-20 14:17:53,714::INFO::train bss model
+2017-03-20 14:35:47,929::INFO::create train loop signals
+2017-03-20 14:35:48,150::INFO::train bss model
+2017-03-20 14:42:52,553::INFO::create train loop signals
+2017-03-20 14:42:52,787::INFO::train bss model
+2017-03-20 14:44:37,713::INFO::create train loop signals
+2017-03-20 14:44:37,915::INFO::train bss model
+2017-03-20 15:02:29,726::INFO::mix signals
+2017-03-20 15:43:35,094::INFO::create train loop signals
+2017-03-20 15:43:35,351::INFO::train bss model
+2017-03-20 15:43:35,834::INFO::mix signals
+2017-03-20 15:43:36,810::INFO::extract stft features
+2017-03-20 15:43:42,115::INFO::train neural network
+2017-03-20 15:45:43,852::INFO::create train loop signals
+2017-03-20 15:45:44,053::INFO::train bss model
+2017-03-20 15:45:44,390::INFO::mix signals
+2017-03-20 15:45:45,170::INFO::extract stft features
+2017-03-20 15:45:49,997::INFO::train neural network
+2017-03-20 15:54:19,900::INFO::create train loop signals
+2017-03-20 15:54:20,189::INFO::train bss model
+2017-03-20 15:54:20,724::INFO::mix signals
+2017-03-20 15:54:21,673::INFO::extract mrcg features
+2017-03-20 15:58:35,318::INFO::create train loop signals
+2017-03-20 15:58:35,523::INFO::train bss model
+2017-03-20 15:58:35,928::INFO::mix signals
+2017-03-20 15:58:37,130::INFO::extract mrcg features
+2017-03-20 16:00:26,688::INFO::create train loop signals
+2017-03-20 16:00:26,951::INFO::train bss model
+2017-03-20 16:00:27,318::INFO::mix signals
+2017-03-20 16:00:28,096::INFO::extract mrcg features
+2017-03-20 16:05:10,155::INFO::create train loop signals
+2017-03-20 16:05:10,411::INFO::train bss model
+2017-03-20 16:05:10,903::INFO::mix signals
+2017-03-20 16:05:11,867::INFO::extract mrcg features
+2017-03-20 16:25:39,597::INFO::create train loop signals
+2017-03-20 16:25:39,804::INFO::train bss model
+2017-03-20 16:25:40,143::INFO::mix signals
+2017-03-20 16:25:40,928::INFO::extract stft features
+2017-03-20 16:32:03,583::INFO::create train loop signals
+2017-03-20 16:32:03,912::INFO::train bss model
+2017-03-20 16:32:04,406::INFO::mix signals
+2017-03-20 16:32:05,446::INFO::extract mrcg features
+2017-03-20 16:50:46,573::INFO::create train loop signals
+2017-03-20 16:50:46,815::INFO::train bss model
+2017-03-20 16:50:47,167::INFO::mix signals
+2017-03-20 16:50:48,145::INFO::extract mrcg features
+2017-03-20 17:34:16,168::INFO::create train loop signals
+2017-03-20 17:34:16,473::INFO::train bss model
+2017-03-20 17:34:16,982::INFO::mix signals
+2017-03-20 17:34:18,142::INFO::extract mrcg features
+2017-03-20 17:59:36,448::INFO::create train loop signals
+2017-03-20 17:59:36,648::INFO::train bss model
+2017-03-20 17:59:36,968::INFO::mix signals
+2017-03-20 17:59:37,724::INFO::extract mrcg features
+2017-03-20 18:51:36,654::INFO::train neural network
+2017-03-20 18:56:58,679::INFO::train neural network with 45 sample(s)
+2017-03-20 18:57:42,477::INFO::Epoch: 0001 cost= 331484.849131944
+2017-03-20 18:57:51,279::INFO::Epoch: 0002 cost= 44319.973046875
+2017-03-20 18:58:00,494::INFO::Epoch: 0003 cost= 20846.143695747
+2017-03-20 18:59:05,877::INFO::Epoch: 0004 cost= 11202.143912760
+2017-03-20 18:59:16,251::INFO::Epoch: 0005 cost= 7289.018402778
+2017-03-20 18:59:28,474::INFO::Epoch: 0006 cost= 5063.790250651
+2017-03-20 19:00:25,948::INFO::Epoch: 0007 cost= 4022.454661730
+2017-03-20 19:00:35,345::INFO::Epoch: 0008 cost= 2703.289432780
+2017-03-20 19:00:43,159::INFO::Epoch: 0009 cost= 2207.877252875
+2017-03-20 19:01:29,246::INFO::Epoch: 0010 cost= 1645.585106744
+2017-03-20 19:01:39,928::INFO::Epoch: 0011 cost= 1616.151487223
+2017-03-20 19:02:38,559::INFO::Epoch: 0012 cost= 1451.948949517
+2017-03-20 19:02:48,535::INFO::Epoch: 0013 cost= 1074.718103027
+2017-03-20 19:02:56,327::INFO::Epoch: 0014 cost= 845.183455743
+2017-03-20 19:03:49,844::INFO::Epoch: 0015 cost= 940.579543389
+2017-03-20 19:03:57,107::INFO::Epoch: 0016 cost= 768.538315837
+2017-03-20 19:04:06,642::INFO::Epoch: 0017 cost= 582.217430623
+2017-03-20 19:05:11,527::INFO::Epoch: 0018 cost= 582.738877699
+2017-03-20 19:05:20,934::INFO::Epoch: 0019 cost= 540.162019518
+2017-03-20 19:05:36,545::INFO::Epoch: 0020 cost= 437.483573066
+2017-03-20 19:06:54,588::INFO::Epoch: 0021 cost= 398.681235250
+2017-03-20 19:07:07,680::INFO::Epoch: 0022 cost= 415.927962748
+2017-03-20 19:07:17,373::INFO::Epoch: 0023 cost= 327.546478102
+2017-03-20 19:08:23,332::INFO::Epoch: 0024 cost= 390.440564473
+2017-03-20 19:08:33,343::INFO::Epoch: 0025 cost= 310.256780328
+2017-03-20 19:08:44,634::INFO::Epoch: 0026 cost= 348.940716892
+2017-03-20 19:09:50,169::INFO::Epoch: 0027 cost= 338.934039646
+2017-03-20 19:09:59,073::INFO::Epoch: 0028 cost= 290.250920444
+2017-03-20 19:10:06,725::INFO::Epoch: 0029 cost= 271.018868510
+2017-03-20 19:11:14,753::INFO::Epoch: 0030 cost= 229.864476183
+2017-03-20 19:11:23,570::INFO::Epoch: 0031 cost= 214.908288405
+2017-03-20 19:11:32,576::INFO::Epoch: 0032 cost= 210.445490858
+2017-03-20 19:12:33,073::INFO::Epoch: 0033 cost= 206.686271837
+2017-03-20 19:12:41,011::INFO::Epoch: 0034 cost= 188.390260824
+2017-03-20 19:12:47,577::INFO::Epoch: 0035 cost= 200.069221327
+2017-03-20 19:13:30,106::INFO::Epoch: 0036 cost= 202.626429749
+2017-03-20 19:13:38,676::INFO::Epoch: 0037 cost= 146.374118720
+2017-03-20 19:14:15,351::INFO::Epoch: 0038 cost= 185.163027869
+2017-03-20 19:14:22,953::INFO::Epoch: 0039 cost= 153.021076965
+2017-03-20 19:14:30,951::INFO::Epoch: 0040 cost= 160.853671265
+2017-03-20 19:15:11,714::INFO::Epoch: 0041 cost= 156.160068597
+2017-03-20 19:15:19,380::INFO::Epoch: 0042 cost= 144.929972839
+2017-03-20 19:15:26,200::INFO::Epoch: 0043 cost= 148.945923106
+2017-03-20 19:16:03,716::INFO::Epoch: 0044 cost= 137.562921312
+2017-03-20 19:16:11,324::INFO::Epoch: 0045 cost= 132.512001546
+2017-03-20 19:16:17,330::INFO::Epoch: 0046 cost= 137.053005303
+2017-03-20 19:16:58,180::INFO::Epoch: 0047 cost= 121.175613912
+2017-03-20 19:17:05,048::INFO::Epoch: 0048 cost= 122.220245446
+2017-03-20 19:17:12,295::INFO::Epoch: 0049 cost= 116.153916677
+2017-03-20 19:17:49,734::INFO::Epoch: 0050 cost= 122.406673855
+2017-03-20 19:17:57,302::INFO::Epoch: 0051 cost= 107.049151866
+2017-03-20 19:18:03,793::INFO::Epoch: 0052 cost= 108.697277154
+2017-03-20 19:18:55,600::INFO::Epoch: 0053 cost= 105.447408803
+2017-03-20 19:19:02,311::INFO::Epoch: 0054 cost= 106.043577237
+2017-03-20 19:19:10,576::INFO::Epoch: 0055 cost= 106.843868595
+2017-03-20 19:20:08,556::INFO::Epoch: 0056 cost= 100.366959720
+2017-03-20 19:20:27,150::INFO::Epoch: 0057 cost= 101.889241367
+2017-03-20 19:20:42,001::INFO::Epoch: 0058 cost= 98.357371436
+2017-03-20 19:21:57,704::INFO::Epoch: 0059 cost= 101.868058014
+2017-03-20 19:22:10,889::INFO::Epoch: 0060 cost= 95.461266157
+2017-03-20 19:22:19,460::INFO::Epoch: 0061 cost= 80.531812117
+2017-03-20 19:23:20,613::INFO::Epoch: 0062 cost= 89.654339939
+2017-03-20 19:23:29,268::INFO::Epoch: 0063 cost= 87.410945638
+2017-03-20 19:24:12,756::INFO::Epoch: 0064 cost= 89.714585453
+2017-03-20 19:24:21,209::INFO::Epoch: 0065 cost= 90.852804565
+2017-03-20 19:24:33,278::INFO::Epoch: 0066 cost= 85.516864183
+2017-03-20 19:25:31,694::INFO::Epoch: 0067 cost= 86.818879784
+2017-03-20 19:25:40,321::INFO::Epoch: 0068 cost= 75.296175978
+2017-03-20 19:25:50,216::INFO::Epoch: 0069 cost= 80.904744805
+2017-03-20 19:27:09,641::INFO::Epoch: 0070 cost= 81.630391778
+2017-03-20 19:27:21,151::INFO::Epoch: 0071 cost= 82.231418186
+2017-03-20 19:27:28,295::INFO::Epoch: 0072 cost= 78.008940209
+2017-03-20 19:28:28,150::INFO::Epoch: 0073 cost= 69.671863810
+2017-03-20 19:28:36,053::INFO::Epoch: 0074 cost= 73.844906108
+2017-03-20 19:28:43,933::INFO::Epoch: 0075 cost= 75.528356595
+2017-03-20 19:29:25,120::INFO::Epoch: 0076 cost= 73.593836806
+2017-03-20 19:29:32,447::INFO::Epoch: 0077 cost= 71.739228736
+2017-03-20 19:29:39,052::INFO::Epoch: 0078 cost= 72.228184679
+2017-03-20 19:30:16,983::INFO::Epoch: 0079 cost= 68.159535556
+2017-03-20 19:30:25,052::INFO::Epoch: 0080 cost= 71.113309903
+2017-03-20 19:30:31,280::INFO::Epoch: 0081 cost= 68.079689026
+2017-03-20 19:31:06,984::INFO::Epoch: 0082 cost= 65.808530002
+2017-03-20 19:31:14,448::INFO::Epoch: 0083 cost= 70.735441166
+2017-03-20 19:31:21,284::INFO::Epoch: 0084 cost= 68.318864271
+2017-03-20 19:32:01,242::INFO::Epoch: 0085 cost= 64.555500285
+2017-03-20 19:32:09,081::INFO::Epoch: 0086 cost= 67.930872006
+2017-03-20 19:32:15,429::INFO::Epoch: 0087 cost= 63.748565080
+2017-03-20 19:32:51,350::INFO::Epoch: 0088 cost= 60.486697049
+2017-03-20 19:33:00,023::INFO::Epoch: 0089 cost= 64.562152439
+2017-03-20 19:33:58,218::INFO::Epoch: 0090 cost= 63.439635468
+2017-03-20 19:34:06,166::INFO::Epoch: 0091 cost= 65.279243639
+2017-03-20 19:34:13,482::INFO::Epoch: 0092 cost= 65.533060964
+2017-03-20 19:34:52,365::INFO::Epoch: 0093 cost= 60.565243106
+2017-03-20 19:35:02,096::INFO::Epoch: 0094 cost= 60.599077691
+2017-03-20 19:35:09,750::INFO::Epoch: 0095 cost= 60.703386095
+2017-03-20 19:35:52,882::INFO::Epoch: 0096 cost= 58.281928338
+2017-03-20 19:36:00,666::INFO::Epoch: 0097 cost= 59.694865248
+2017-03-20 19:36:07,140::INFO::Epoch: 0098 cost= 60.813490974
+2017-03-20 19:36:45,884::INFO::Epoch: 0099 cost= 59.000525750
+2017-03-20 19:36:53,273::INFO::Epoch: 0100 cost= 56.970301565
+2017-03-20 19:36:53,430::INFO::Optimization Finished!
